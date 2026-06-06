@@ -22,6 +22,14 @@ class ValidationIssue:
         return f"{tag}  {sid}{self.message}"
 
 
+def _resolve_path(dataset_root: Path, p_str: str) -> Path:
+    """Resolve a path that may be relative (Colab-style) or absolute (legacy)."""
+    p = Path(p_str)
+    if not p.is_absolute():
+        p = dataset_root / p
+    return p
+
+
 def validate_dataset(dataset_root: Path) -> list[ValidationIssue]:
     """Run all validation checks and return a list of issues."""
     issues: list[ValidationIssue] = []
@@ -40,20 +48,27 @@ def validate_dataset(dataset_root: Path) -> list[ValidationIssue]:
 
     for _, row in df.iterrows():
         sid = str(row.get("sample_id", "")).strip()
+        label_status = str(row.get("label_status", "queued")).strip()
 
         if sid in seen_ids:
             issues.append(ValidationIssue(sid, "Duplicate sample_id", "error"))
         seen_ids.add(sid)
 
-        img_p = Path(str(row.get("image_path", "")))
-        msk_p = Path(str(row.get("mask_path", "")))
+        # Resolve image/mask paths: support both relative (Colab) and absolute (legacy)
+        img_p = _resolve_path(dataset_root, str(row.get("image_path", "")))
+        msk_p = _resolve_path(dataset_root, str(row.get("mask_path", "")))
 
         if not img_p.exists():
             issues.append(ValidationIssue(sid, f"Image missing: {img_p.name}", "error"))
             continue
 
-        if not msk_p.exists():
-            issues.append(ValidationIssue(sid, f"Mask missing: {msk_p.name}", "error"))
+        mask_exists = msk_p.exists()
+        if not mask_exists:
+            # Frames that are complete/uncertain/needs_review must have a mask
+            if label_status in ("complete", "uncertain", "needs_review"):
+                issues.append(ValidationIssue(sid, f"Mask missing for '{label_status}' frame", "error"))
+            else:
+                issues.append(ValidationIssue(sid, f"Mask missing (status: {label_status})", "warning"))
             continue
 
         img = cv2.imread(str(img_p))
@@ -90,5 +105,20 @@ def validate_dataset(dataset_root: Path) -> list[ValidationIssue]:
                     "error",
                 )
             )
+
+        # Check mask_positive_pixels accuracy in metadata
+        try:
+            recorded = int(float(row.get("mask_positive_pixels", -1)))
+            actual = int(np.sum(msk > 0))
+            if recorded >= 0 and recorded != actual:
+                issues.append(
+                    ValidationIssue(
+                        sid,
+                        f"mask_positive_pixels mismatch: recorded {recorded}, actual {actual}",
+                        "warning",
+                    )
+                )
+        except (TypeError, ValueError):
+            pass
 
     return issues

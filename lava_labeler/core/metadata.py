@@ -71,8 +71,10 @@ class FrameRecord:
         return self.roi_height if (self.is_roi_crop and self.roi_height) else self.source_height
 
     def to_row(self, dataset_root: Path) -> dict:
-        img_path = str(dataset_root / "images" / "all" / f"{self.sample_id}.png")
-        msk_path = str(dataset_root / "masks" / "all" / f"{self.sample_id}_mask.png")
+        # Store paths RELATIVE to dataset root for Colab portability.
+        # Colab loads: Path(dataset_root) / row["image_path"]
+        img_path = f"images/all/{self.sample_id}.png"
+        msk_path = f"masks/all/{self.sample_id}_mask.png"
         return {
             "sample_id": self.sample_id,
             "image_path": img_path,

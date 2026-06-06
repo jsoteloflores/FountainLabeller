@@ -305,25 +305,31 @@ class LabelingCanvas(ttk.Frame):
         self, points: list[tuple[float, float]]
     ) -> None:
         """Apply the active tool to *points* on the full-resolution mask."""
-        if self._mask is None:
+        if self._mask is None or self._frame is None:
             return
-        if self._tool == "otsu_brush":
-            if self._frame is not None:
-                apply_otsu_stroke(self._mask, self._frame, points, self._brush_radius, 255)
-            else:
-                # No source frame available yet — fall back to regular brush
-                apply_stroke(self._mask, points, self._brush_radius, 255)
+        h, w = self._mask.shape
+        # Filter points to those inside the image
+        valid = [(x, y) for (x, y) in points if 0 <= x < w and 0 <= y < h]
+        if not valid:
+            return
+        if self._tool == "brightness_assist":
+            apply_otsu_stroke(self._mask, self._frame, valid, self._brush_radius, 255)
         else:
             value = 255 if self._tool == "brush" else 0
-            apply_stroke(self._mask, points, self._brush_radius, value)
+            apply_stroke(self._mask, valid, self._brush_radius, value)
 
     def _start_stroke(self, sx: int, sy: int) -> None:
         if self._mask is None:
             return
+        ix, iy = self.viewport.screen_to_image(sx, sy)
+        # Reject strokes that start entirely outside the image
+        if self._frame is not None:
+            h, w = self._frame.shape[:2]
+            if not (0 <= ix < w and 0 <= iy < h):
+                return
         # Snapshot full mask before stroke for undo patch extraction at end
         self._pre_stroke_mask = self._mask.copy()
         self._stroking = True
-        ix, iy = self.viewport.screen_to_image(sx, sy)
         self._stroke_points = [(ix, iy)]
         self._apply_stroke_segment([(ix, iy)])
         self._schedule_redraw()
@@ -371,7 +377,7 @@ class LabelingCanvas(ttk.Frame):
         r_screen = self._brush_radius * self.viewport.zoom
         color = (
             "#00ff88" if self._tool == "brush"
-            else "#ff9900" if self._tool == "otsu_brush"
+            else "#ff9900" if self._tool == "brightness_assist"
             else "#ff4444"
         )
         self._canvas.create_oval(
@@ -454,10 +460,15 @@ class LabelingCanvas(ttk.Frame):
         else:
             display_img = pil_frame
 
-        # Paste crop onto a full-canvas background image
+        # Paste crop onto a full-canvas background image.
+        # paste_x/paste_y can legitimately be negative when the image is panned
+        # so that its left/top edge is off the left/top of the canvas.
+        # PIL.Image.paste() handles negative offsets correctly (clips to dest).
+        # DO NOT clamp to max(0, ...) — that would shift the displayed image
+        # relative to the coordinate system and break brush accuracy.
         canvas_img = Image.new("RGB", (cw, ch), (26, 26, 26))
-        paste_x = max(0, int(round(screen_x0)))
-        paste_y = max(0, int(round(screen_y0)))
+        paste_x = int(round(screen_x0))
+        paste_y = int(round(screen_y0))
         canvas_img.paste(display_img, (paste_x, paste_y))
 
         self._blit(canvas_img)

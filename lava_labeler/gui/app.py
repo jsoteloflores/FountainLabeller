@@ -32,13 +32,14 @@ class App(tk.Tk):
         self.video_reader: VideoReader | None = None
         self.dataset: DatasetFolder | None = None
         self.metadata: MetadataStore | None = None
-        self.frame_cache = FrameCache(max_size=60)
+        self.frame_cache = FrameCache()          # 512 MB byte-budgeted LRU
         self.current_frame_index: int = 0
         self._active_sample_id: str | None = None
 
         self._build_menu()
         self._build_layout()
         self._bind_keys()
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
 
     # ------------------------------------------------------------------
     # Layout
@@ -166,9 +167,9 @@ class App(tk.Tk):
         if not path:
             return
         try:
-            # Autosave unsaved mask before switching videos
-            if self.canvas._mode == "label" and self.canvas._unsaved:
-                self.save_current_mask()
+            # Guard unsaved changes before switching to a new video
+            if not self._check_unsaved(context="before opening a new video"):
+                return
             if self.video_reader:
                 self.video_reader.close()
             self.video_reader = VideoReader(path)
@@ -231,6 +232,8 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
 
     def new_dataset(self) -> None:
+        if not self._check_unsaved(context="before creating a new dataset"):
+            return
         path = filedialog.askdirectory(title="Select or Create Dataset Folder")
         if not path:
             return
@@ -242,6 +245,8 @@ class App(tk.Tk):
         self.set_status(f"Dataset created: {path}")
 
     def open_dataset(self) -> None:
+        if not self._check_unsaved(context="before opening another dataset"):
+            return
         path = filedialog.askdirectory(title="Open Existing Dataset Folder")
         if not path:
             return
@@ -308,15 +313,14 @@ class App(tk.Tk):
         if rec is None:
             return
 
-        # Autosave the currently-open mask before switching to a different frame
+        # Guard unsaved changes when switching to a different frame
         if (
             self._active_sample_id is not None
             and self._active_sample_id != sample_id
-            and self.canvas._mode == "label"
-            and self.canvas._unsaved
         ):
-            self.save_current_mask()
-            self.set_status(f"Autosaved {self._active_sample_id}")
+            if not self._check_unsaved(context=f"before switching away from {self._active_sample_id}"):
+                return
+
         self._active_sample_id = sample_id
 
         # Load frame from the record's specific video — never use the browse cache
@@ -350,10 +354,12 @@ class App(tk.Tk):
         mask = self.dataset.load_mask(sample_id)
         self.canvas.set_labeling_frame(frame, mask, sample_id)
         self.metadata_panel.load_record(rec)
-        self.metadata.update(sample_id, label_status="in_progress")
+        # Only advance status if the frame hasn't been worked on yet
+        if rec.label_status == "queued":
+            self.metadata.update(sample_id, label_status="in_progress")
         self.metadata.save()
         self.frame_queue.refresh()
-        self.set_status(f"Labeling: {sample_id}")
+        self.set_status(f"Labeling: {sample_id}  [{rec.label_status}]")
 
     def save_current_mask(self) -> None:
         sid = self._active_sample_id
@@ -381,6 +387,29 @@ class App(tk.Tk):
             generate_thumbnail(frame, mask, self.dataset.qc_thumb_path(sid))
 
         self.set_status(f"Saved {sid}  ({pos_pixels} positive px, {pos_pixels/total*100:.1f}%)")
+
+    def warn_if_empty_mask_complete(self) -> bool:
+        """Called before marking a frame 'complete'.  Returns True if safe to proceed."""
+        mask = self.canvas.get_current_mask()
+        if mask is not None and int(np.sum(mask > 0)) == 0:
+            answer = messagebox.askyesnocancel(
+                "Empty mask",
+                "This mask contains no positive pixels.\n\n"
+                "Is this a true-negative frame (no visible lava)?\n\n"
+                "  Yes  → Mark complete (true negative)\n"
+                "  No   → Cancel, keep editing\n"
+                "  Cancel → Mark as Needs Review instead",
+            )
+            if answer is None:      # Cancel → needs_review
+                if self._active_sample_id and self.metadata:
+                    self.metadata.update(self._active_sample_id, label_status="needs_review")
+                    self.metadata.save()
+                    self.frame_queue.refresh()
+                return False
+            if not answer:          # No → keep editing
+                return False
+            # Yes → allow through as true negative
+        return True
 
     # ------------------------------------------------------------------
     # Edit
@@ -426,10 +455,39 @@ class App(tk.Tk):
         self.status_var.set(msg)
 
     # ------------------------------------------------------------------
+    # Unsaved-changes guard
+    # ------------------------------------------------------------------
+
+    def _check_unsaved(self, context: str = "") -> bool:
+        """If there are unsaved mask edits, prompt Save / Discard / Cancel.
+
+        Returns True if the caller may proceed, False if the user cancelled.
+        """
+        if not (self.canvas._mode == "label" and self.canvas._unsaved):
+            return True  # nothing to guard
+
+        sid = self._active_sample_id or "current frame"
+        prompt = f"Unsaved mask changes on\n{sid}"
+        if context:
+            prompt += f"\n({context})"
+        answer = messagebox.askyesnocancel(
+            "Unsaved changes",
+            prompt + "\n\nSave changes before continuing?",
+        )
+        if answer is None:   # Cancel → stay put
+            return False
+        if answer:           # Yes → save, then proceed
+            self.save_current_mask()
+        # False (Discard) or saved: proceed
+        return True
+
+    # ------------------------------------------------------------------
     # Quit
     # ------------------------------------------------------------------
 
     def quit_app(self) -> None:
+        if not self._check_unsaved(context="before quitting"):
+            return
         if self.video_reader:
             self.video_reader.close()
         self.destroy()

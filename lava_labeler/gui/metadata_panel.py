@@ -30,11 +30,13 @@ class MetadataPanel(ttk.LabelFrame):
         # Episode / camera IDs (also used when adding frames to queue)
         ttk.Label(self, text="Episode:").grid(row=0, column=0, **PAD, **sticky)
         self.episode_var = tk.StringVar()
-        ttk.Entry(self, textvariable=self.episode_var, width=14).grid(row=0, column=1, **PAD, **sticky)
+        self._episode_entry = ttk.Entry(self, textvariable=self.episode_var, width=14)
+        self._episode_entry.grid(row=0, column=1, **PAD, **sticky)
 
         ttk.Label(self, text="Camera:").grid(row=1, column=0, **PAD, **sticky)
         self.camera_var = tk.StringVar()
-        ttk.Entry(self, textvariable=self.camera_var, width=14).grid(row=1, column=1, **PAD, **sticky)
+        self._camera_entry = ttk.Entry(self, textvariable=self.camera_var, width=14)
+        self._camera_entry.grid(row=1, column=1, **PAD, **sticky)
 
         # Status
         ttk.Label(self, text="Status:").grid(row=2, column=0, **PAD, **sticky)
@@ -108,14 +110,22 @@ class MetadataPanel(ttk.LabelFrame):
         self._tephra_var.set(rec.contains_tephra)
         self._smoke_var.set(rec.contains_smoke)
         self._base_glow_var.set(rec.contains_base_glow)
+        # Lock identity fields — sample_id is derived from episode+camera+frame,
+        # so they must not change after the record has been created.
+        self._episode_entry.config(state="readonly")
+        self._camera_entry.config(state="readonly")
+
+    def unlock_identity_fields(self) -> None:
+        """Call this only when creating a brand-new (not yet queued) entry."""
+        self._episode_entry.config(state="normal")
+        self._camera_entry.config(state="normal")
 
     def _apply(self) -> None:
         sid = self._sample_id
         if sid and self.app.metadata:
             self.app.metadata.update(
                 sid,
-                episode_id=self.episode_var.get(),
-                camera_id=self.camera_var.get(),
+                # episode_id / camera_id intentionally omitted — locked after queueing
                 label_status=self._status_var.get(),
                 difficulty=self._difficulty_var.get(),
                 lighting_condition=self._lighting_var.get(),
@@ -129,5 +139,9 @@ class MetadataPanel(ttk.LabelFrame):
             self.app.set_status(f"Metadata saved for {sid}")
 
     def _set_status(self, status: str) -> None:
+        # Guard: warn before marking complete with an empty mask
+        if status == "complete":
+            if not self.app.warn_if_empty_mask_complete():
+                return
         self._status_var.set(status)
         self._apply()

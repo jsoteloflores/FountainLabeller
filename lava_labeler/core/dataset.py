@@ -175,6 +175,8 @@ class DatasetFolder:
     def save_mask(self, sample_id: str, mask: np.ndarray) -> Path:
         if mask.dtype != np.uint8:
             raise ValueError("Mask must be uint8.")
+        # Canonicalize to strict binary before writing
+        mask = np.where(mask > 0, 255, 0).astype(np.uint8)
         path = self.mask_path(sample_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(path), mask)
@@ -184,7 +186,11 @@ class DatasetFolder:
         path = self.mask_path(sample_id)
         if not path.exists():
             return None
-        return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        raw = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        if raw is None:
+            return None
+        # Canonicalize to strict binary: handles any imported or non-binary mask
+        return np.where(raw > 0, 255, 0).astype(np.uint8)
 
     def load_image(self, sample_id: str) -> np.ndarray | None:
         path = self.image_path(sample_id)

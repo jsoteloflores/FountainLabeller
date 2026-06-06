@@ -39,7 +39,7 @@ class Toolbar(ttk.Frame):
             command=self._on_tool_change,
         ).pack(side=tk.LEFT, **PAD)
         ttk.Radiobutton(
-            self, text="Otsu", variable=self._tool_var, value="otsu_brush",
+            self, text="Brightness Assist ⚠", variable=self._tool_var, value="brightness_assist",
             command=self._on_tool_change,
         ).pack(side=tk.LEFT, **PAD)
 
