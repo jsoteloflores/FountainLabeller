@@ -87,7 +87,19 @@ class Toolbar(ttk.Frame):
         ttk.Button(self, text="100%", command=self.app.zoom_100).pack(side=tk.LEFT, **PAD)
         ttk.Button(self, text="＋", width=2, command=self.app.zoom_in).pack(side=tk.LEFT, **PAD)
         ttk.Button(self, text="－", width=2, command=self.app.zoom_out).pack(side=tk.LEFT, **PAD)
+        ttk.Separator(self, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4)
 
+        # ---- Pan speed ----
+        ttk.Label(self, text="Pan:").pack(side=tk.LEFT, padx=(4, 0))
+        self._pan_speed_var = tk.DoubleVar(value=1.0)
+        pan_spin = ttk.Spinbox(
+            self, from_=0.1, to=10.0, increment=0.1,
+            textvariable=self._pan_speed_var, width=5, format="%.1f",
+            command=self._on_pan_speed_change,
+        )
+        pan_spin.pack(side=tk.LEFT, **PAD)
+        pan_spin.bind("<Return>", lambda _: self._on_pan_speed_change())
+        pan_spin.bind("<FocusOut>", lambda _: self._on_pan_speed_change())
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
@@ -105,6 +117,15 @@ class Toolbar(ttk.Frame):
         try:
             r = int(self._brush_var.get())
             self.app.canvas.set_brush_radius(r)
+        except (ValueError, tk.TclError):
+            pass
+
+    def _on_pan_speed_change(self) -> None:
+        try:
+            speed = float(self._pan_speed_var.get())
+            speed = max(0.1, min(10.0, speed))
+            self._pan_speed_var.set(round(speed, 1))
+            self.app.canvas.set_pan_speed(speed)
         except (ValueError, tk.TclError):
             pass
 

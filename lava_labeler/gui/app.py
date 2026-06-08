@@ -441,6 +441,60 @@ class App(tk.Tk):
     # Export
     # ------------------------------------------------------------------
 
+    def rename_sample(self, old_sid: str, new_sid: str, new_ep: str, new_cam: str) -> bool:
+        """Rename all files and metadata for *old_sid* → *new_sid*.
+
+        Moves image, mask, and QC files; updates the metadata row; updates
+        _active_sample_id if it matches. Returns True on success.
+        """
+        if self.dataset is None or self.metadata is None:
+            return False
+
+        if self.metadata.get(new_sid) is not None:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Rename conflict",
+                f"A frame with ID\n{new_sid}\nalready exists in the dataset.",
+            )
+            return False
+
+        import shutil
+        from pathlib import Path
+
+        ds = self.dataset
+
+        def _move(src: Path, dst: Path) -> None:
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+
+        try:
+            _move(ds.image_path(old_sid),      ds.image_path(new_sid))
+            _move(ds.mask_path(old_sid),        ds.mask_path(new_sid))
+            _move(ds.qc_overlay_path(old_sid),  ds.qc_overlay_path(new_sid))
+            _move(ds.qc_thumb_path(old_sid),    ds.qc_thumb_path(new_sid))
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Rename failed", f"File move error:\n{exc}")
+            return False
+
+        # Update metadata record in-place (keep everything except identity fields)
+        rec = self.metadata.get(old_sid)
+        if rec is not None:
+            rec.sample_id = new_sid
+            rec.episode_id = new_ep
+            rec.camera_id = new_cam
+            self.metadata.remove(old_sid)
+            self.metadata.add(rec)
+            self.metadata.save()
+
+        if self._active_sample_id == old_sid:
+            self._active_sample_id = new_sid
+
+        self.frame_queue.refresh()
+        self.set_status(f"Renamed {old_sid} → {new_sid}")
+        return True
+
     def open_export_dialog(self) -> None:
         if self.dataset is None or self.metadata is None:
             messagebox.showwarning("No dataset", "Open a dataset first.")

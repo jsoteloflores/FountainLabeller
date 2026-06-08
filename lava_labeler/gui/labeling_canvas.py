@@ -51,6 +51,7 @@ class LabelingCanvas(ttk.Frame):
         self._mask_visible: bool = True
         self._mask_alpha: float = 0.5
         self._unsaved: bool = False
+        self._pan_speed: float = 1.0   # multiplier applied to scroll-based panning
 
         # Stroke tracking
         self._stroking: bool = False
@@ -124,6 +125,9 @@ class LabelingCanvas(ttk.Frame):
 
     def adjust_brush(self, delta: int) -> None:
         self.set_brush_radius(self._brush_radius + delta)
+
+    def set_pan_speed(self, speed: float) -> None:
+        self._pan_speed = max(0.1, min(10.0, speed))
 
     def set_mask_visible(self, visible: bool) -> None:
         self._mask_visible = visible
@@ -249,12 +253,12 @@ class LabelingCanvas(ttk.Frame):
             factor = 1.1 if event.delta > 0 else 1 / 1.1
             self.viewport.zoom_at(event.x, event.y, factor)
         else:
-            # Pan vertically
-            self.viewport.pan_y += event.delta * 0.4
+            # Pan vertically — base sensitivity 0.4, scaled by user pan_speed
+            self.viewport.pan_y += event.delta * 0.4 * self._pan_speed
         self._schedule_redraw()
 
     def _on_scroll_h(self, event: tk.Event) -> None:
-        self.viewport.pan_x += event.delta * 0.4
+        self.viewport.pan_x += event.delta * 0.4 * self._pan_speed
         self._schedule_redraw()
 
     def _on_middle_press(self, event: tk.Event) -> None:
