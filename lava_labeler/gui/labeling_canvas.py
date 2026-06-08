@@ -57,6 +57,16 @@ class LabelingCanvas(ttk.Frame):
         self._stroking: bool = False
         self._stroke_points: list[tuple[float, float]] = []
         self._pre_stroke_mask: np.ndarray | None = None   # full-mask copy before stroke
+        self._current_stroke_tool: str | None = None      # locked at stroke start
+
+        # Shift-key state (for temporary eraser)
+        self._shift_down: bool = False
+
+        # ROI state (image coordinates: x, y, w, h)
+        self._roi: tuple[int, int, int, int] | None = None
+        self._roi_visible: bool = True
+        self._roi_dragging: bool = False
+        self._roi_drag_offset: tuple[float, float] = (0.0, 0.0)
 
         # Pan tracking
         self._panning: bool = False
@@ -129,6 +139,21 @@ class LabelingCanvas(ttk.Frame):
     def set_pan_speed(self, speed: float) -> None:
         self._pan_speed = max(0.1, min(10.0, speed))
 
+    # ROI ---------------------------------------------------------------
+
+    def set_roi(self, x: int, y: int, w: int, h: int) -> None:
+        self._roi = (x, y, w, h)
+        self._schedule_redraw()
+
+    def clear_roi(self) -> None:
+        self._roi = None
+        self._canvas.delete("roi_rect")
+        self._schedule_redraw()
+
+    def set_roi_visible(self, visible: bool) -> None:
+        self._roi_visible = visible
+        self._schedule_redraw()
+
     def set_mask_visible(self, visible: bool) -> None:
         self._mask_visible = visible
         self._schedule_redraw()
@@ -200,6 +225,12 @@ class LabelingCanvas(ttk.Frame):
         self.bind_all("<Shift-bracketleft>", lambda _: self.adjust_brush(-10))
         self.bind_all("<Shift-bracketright>", lambda _: self.adjust_brush(10))
 
+        # Shift key tracking — temporary eraser while Shift is held during a stroke
+        self.bind_all("<KeyPress-Shift_L>", self._on_shift_press, add=True)
+        self.bind_all("<KeyPress-Shift_R>", self._on_shift_press, add=True)
+        self.bind_all("<KeyRelease-Shift_L>", self._on_shift_release, add=True)
+        self.bind_all("<KeyRelease-Shift_R>", self._on_shift_release, add=True)
+
     # ------------------------------------------------------------------
     # Mouse events
     # ------------------------------------------------------------------
@@ -211,12 +242,20 @@ class LabelingCanvas(ttk.Frame):
         if self._space_held:
             self._start_pan(event.x, event.y)
             return
+        # ROI drag is only active in browse mode
+        if self._mode == "browse" and self._roi is not None and self._roi_visible:
+            if self._point_in_roi(event.x, event.y):
+                self._start_roi_drag(event.x, event.y)
+                return
         if self._mode == "label" and self._mask is not None:
             self._start_stroke(event.x, event.y)
 
     def _on_drag(self, event: tk.Event) -> None:
         if self._panning:
             self._update_pan(event.x, event.y)
+            return
+        if self._roi_dragging:
+            self._update_roi_drag(event.x, event.y)
             return
         if self._stroking:
             self._continue_stroke(event.x, event.y)
@@ -227,6 +266,9 @@ class LabelingCanvas(ttk.Frame):
         if self._panning:
             self._end_pan()
             return
+        if self._roi_dragging:
+            self._end_roi_drag()
+            return
         if self._stroking:
             self._end_stroke()
 
@@ -235,9 +277,12 @@ class LabelingCanvas(ttk.Frame):
             self._draw_cursor(event.x, event.y)
         if self._frame is not None:
             ix, iy = self.viewport.screen_to_image(event.x, event.y)
+            shift_eraser = self._shift_down and self._tool != "eraser"
+            tool_str = "Eraser (Shift)" if shift_eraser else self._tool
             self.app.set_status(
                 f"img ({int(ix)}, {int(iy)})  |  "
                 f"zoom {self.viewport.zoom_percent:.0f}%  |  "
+                f"tool: {tool_str}  |  "
                 f"brush r={self._brush_radius}px"
                 + ("  [UNSAVED]" if self._unsaved else "")
             )
@@ -316,10 +361,11 @@ class LabelingCanvas(ttk.Frame):
         valid = [(x, y) for (x, y) in points if 0 <= x < w and 0 <= y < h]
         if not valid:
             return
-        if self._tool == "brightness_assist":
+        tool = self._current_stroke_tool or self._tool
+        if tool == "otsu_brush":
             apply_otsu_stroke(self._mask, self._frame, valid, self._brush_radius, 255)
         else:
-            value = 255 if self._tool == "brush" else 0
+            value = 255 if tool == "brush" else 0
             apply_stroke(self._mask, valid, self._brush_radius, value)
 
     def _start_stroke(self, sx: int, sy: int) -> None:
@@ -335,6 +381,8 @@ class LabelingCanvas(ttk.Frame):
         self._pre_stroke_mask = self._mask.copy()
         self._stroking = True
         self._stroke_points = [(ix, iy)]
+        # Lock stroke tool at press time: Shift → temporary eraser
+        self._current_stroke_tool = "eraser" if self._shift_down else self._tool
         self._apply_stroke_segment([(ix, iy)])
         self._schedule_redraw()
 
@@ -367,6 +415,7 @@ class LabelingCanvas(ttk.Frame):
 
         self._pre_stroke_mask = None
         self._stroke_points = []
+        self._current_stroke_tool = None
         self._unsaved = True
         self._schedule_redraw()
 
@@ -379,10 +428,16 @@ class LabelingCanvas(ttk.Frame):
         if self._mode != "label":
             return
         r_screen = self._brush_radius * self.viewport.zoom
+        # Determine effective visual tool: mid-stroke uses locked tool;
+        # before a stroke, Shift overrides the selection for preview.
+        if self._stroking:
+            effective = self._current_stroke_tool or self._tool
+        else:
+            effective = "eraser" if (self._shift_down and self._tool != "eraser") else self._tool
         color = (
-            "#00ff88" if self._tool == "brush"
-            else "#ff9900" if self._tool == "brightness_assist"
-            else "#ff4444"
+            "#ff4444" if effective == "eraser"
+            else "#ff9900" if effective == "otsu_brush"
+            else "#00ff88"
         )
         self._canvas.create_oval(
             sx - r_screen, sy - r_screen,
@@ -476,6 +531,7 @@ class LabelingCanvas(ttk.Frame):
         canvas_img.paste(display_img, (paste_x, paste_y))
 
         self._blit(canvas_img)
+        self._draw_roi_overlay()
 
     def _blit(self, img: Image.Image) -> None:
         photo = ImageTk.PhotoImage(img)
@@ -486,3 +542,78 @@ class LabelingCanvas(ttk.Frame):
             self._canvas.itemconfig(self._image_id, image=photo)
         # Raise cursor ring above the image
         self._canvas.tag_raise("cursor_ring")
+
+    def _draw_roi_overlay(self) -> None:
+        """Draw the ROI rectangle on the canvas in browse mode."""
+        self._canvas.delete("roi_rect")
+        if self._roi is None or not self._roi_visible or self._mode != "browse":
+            return
+        rx, ry, rw, rh = self._roi
+        sx0, sy0 = self.viewport.image_to_screen(rx, ry)
+        sx1, sy1 = self.viewport.image_to_screen(rx + rw, ry + rh)
+        # Dashed yellow border
+        self._canvas.create_rectangle(
+            sx0, sy0, sx1, sy1,
+            outline="#ffdd00", width=2, dash=(8, 4),
+            tags="roi_rect",
+        )
+        # Small drag-handle dot at centre
+        cx, cy = (sx0 + sx1) / 2, (sy0 + sy1) / 2
+        self._canvas.create_oval(
+            cx - 5, cy - 5, cx + 5, cy + 5,
+            fill="#ffdd00", outline="",
+            tags="roi_rect",
+        )
+        self._canvas.tag_raise("cursor_ring")
+
+    # ------------------------------------------------------------------
+    # Shift key handlers
+    # ------------------------------------------------------------------
+
+    def _on_shift_press(self, _event: tk.Event) -> None:
+        self._shift_down = True
+
+    def _on_shift_release(self, _event: tk.Event) -> None:
+        self._shift_down = False
+
+    # ------------------------------------------------------------------
+    # ROI drag
+    # ------------------------------------------------------------------
+
+    def _point_in_roi(self, sx: int, sy: int) -> bool:
+        """Return True if screen point (sx, sy) falls inside the current ROI."""
+        if self._roi is None:
+            return False
+        rx, ry, rw, rh = self._roi
+        sx0, sy0 = self.viewport.image_to_screen(rx, ry)
+        sx1, sy1 = self.viewport.image_to_screen(rx + rw, ry + rh)
+        return sx0 <= sx <= sx1 and sy0 <= sy <= sy1
+
+    def _start_roi_drag(self, sx: int, sy: int) -> None:
+        self._roi_dragging = True
+        rx, ry = self._roi[0], self._roi[1]
+        ix, iy = self.viewport.screen_to_image(sx, sy)
+        # offset of click inside ROI, so the box doesn't jump to cursor position
+        self._roi_drag_offset = (ix - rx, iy - ry)
+
+    def _update_roi_drag(self, sx: int, sy: int) -> None:
+        if self._roi is None:
+            return
+        ix, iy = self.viewport.screen_to_image(sx, sy)
+        rx, ry, rw, rh = self._roi
+        new_x = ix - self._roi_drag_offset[0]
+        new_y = iy - self._roi_drag_offset[1]
+        # Clamp inside the source frame
+        if self._frame is not None:
+            fh, fw = self._frame.shape[:2]
+            new_x = int(max(0, min(new_x, fw - rw)))
+            new_y = int(max(0, min(new_y, fh - rh)))
+        else:
+            new_x = max(0, int(new_x))
+            new_y = max(0, int(new_y))
+        self._roi = (new_x, new_y, rw, rh)
+        self.app.on_roi_dragged(new_x, new_y, rw, rh)
+        self._schedule_redraw()
+
+    def _end_roi_drag(self) -> None:
+        self._roi_dragging = False

@@ -22,6 +22,7 @@ COLUMNS = [
     "frame_index", "time_seconds",
     "source_width", "source_height", "export_width", "export_height",
     "roi_x", "roi_y", "roi_width", "roi_height", "is_roi_crop",
+    "roi_mode", "roi_size_policy",
     "label_status", "labeler", "notes", "difficulty", "lighting_condition",
     "contains_tephra", "contains_smoke", "contains_base_glow",
     "mask_positive_pixels", "mask_positive_fraction",
@@ -55,6 +56,8 @@ class FrameRecord:
     roi_width: Optional[int] = None
     roi_height: Optional[int] = None
     is_roi_crop: bool = False
+    roi_mode: str = "full_frame"          # "full_frame" | "fixed_roi_crop"
+    roi_size_policy: str = "none"         # "none" | "global_fixed" | "camera_fixed"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -94,6 +97,8 @@ class FrameRecord:
             "roi_width": self.roi_width,
             "roi_height": self.roi_height,
             "is_roi_crop": self.is_roi_crop,
+            "roi_mode": self.roi_mode,
+            "roi_size_policy": self.roi_size_policy,
             "label_status": self.label_status,
             "labeler": self.labeler,
             "notes": self.notes,
@@ -187,6 +192,8 @@ class MetadataStore:
             roi_width=_opt_i("roi_width"),
             roi_height=_opt_i("roi_height"),
             is_roi_crop=_b("is_roi_crop"),
+            roi_mode=_s("roi_mode", "full_frame"),
+            roi_size_policy=_s("roi_size_policy", "none"),
             created_at=_s("created_at", datetime.now(timezone.utc).isoformat()),
             updated_at=_s("updated_at", datetime.now(timezone.utc).isoformat()),
         )

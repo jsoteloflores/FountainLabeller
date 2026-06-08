@@ -23,6 +23,15 @@ _DEFAULT_CONFIG: dict = {
     },
     "images_are_source_resolution": True,
     "masks_match_images_exactly": True,
+    "roi_policy": {
+        "enabled": True,
+        "preferred_mode": "fixed_size_draggable_roi",
+        "description": (
+            "Samples may be source-resolution crops using a fixed-size ROI placed over "
+            "the target fountain. Pixels outside the ROI are outside the analysis domain "
+            "and are not treated as negative examples."
+        ),
+    },
     "created_by": "lava-labeler",
     "notes": "",
 }
@@ -32,18 +41,26 @@ _CLASS_DEFINITION = """\
 
 ## Positive Class
 
-Visible airborne incandescent blackbody lava fountain material.
+Visible airborne incandescent lava fountain material **inside the selected
+target-fountain analysis ROI**.
 
 ## Negative Class
 
-Everything else, including:
+Everything else inside the ROI, including sky, smoke, crater walls, base glow,
+ground lava, non-incandescent tephra, artifacts, and non-target material inside
+the ROI.
 
-- Vent/base glow
-- Ground lava surfaces
-- Tephra/ash that is not visibly incandescent airborne lava
-- Steam, smoke, clouds, sky
-- Crater walls, camera artifacts, reflections
-- Fully occluded lava
+## Outside ROI
+
+Pixels outside the ROI are outside the analysis domain for ROI-crop datasets.
+They are not labeled as positive or negative and should not be used to penalize
+the model.
+
+## Nearby Vents
+
+Nearby vents outside the target ROI are excluded from training and measurement
+so that non-target incandescent activity does not bias target-fountain
+segmentation.
 
 ## Edge Cases
 

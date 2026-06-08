@@ -18,6 +18,7 @@ from lava_labeler.gui.export_dialog import ExportDialog
 from lava_labeler.gui.frame_queue import FrameQueuePanel
 from lava_labeler.gui.labeling_canvas import LabelingCanvas
 from lava_labeler.gui.metadata_panel import MetadataPanel
+from lava_labeler.gui.roi_panel import ROIPanel
 from lava_labeler.gui.toolbar import Toolbar
 
 
@@ -35,6 +36,14 @@ class App(tk.Tk):
         self.frame_cache = FrameCache()          # 512 MB byte-budgeted LRU
         self.current_frame_index: int = 0
         self._active_sample_id: str | None = None
+
+        # ROI state
+        self._roi_mode: str = "full_frame"           # "full_frame" | "fixed_roi_crop"
+        self._roi_size_policy: str = "global_fixed"  # "none" | "global_fixed" | "camera_fixed"
+        self._roi_x: int = 0
+        self._roi_y: int = 0
+        self._roi_w: int = 1280
+        self._roi_h: int = 960
 
         self._build_menu()
         self._build_layout()
@@ -70,6 +79,11 @@ class App(tk.Tk):
         # Top toolbar
         self.toolbar = Toolbar(self, app=self)
         self.toolbar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=2)
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
+        # ROI panel (below main toolbar)
+        self.roi_panel = ROIPanel(self, app=self)
+        self.roi_panel.pack(side=tk.TOP, fill=tk.X, padx=4, pady=1)
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         # Main area (canvas + right panel)
@@ -151,6 +165,15 @@ class App(tk.Tk):
         self.bind_all("<Right>", lambda _: self._jump(1))
         self.bind_all("<Shift-Left>",  lambda _: self._jump(-self.step_var.get()))
         self.bind_all("<Shift-Right>", lambda _: self._jump(self.step_var.get()))
+        # ROI nudge — Ctrl+Arrow (1 px), Ctrl+Shift+Arrow (10 px)
+        self.bind_all("<Control-Left>",        lambda _: self.nudge_roi(-1, 0))
+        self.bind_all("<Control-Right>",       lambda _: self.nudge_roi(1, 0))
+        self.bind_all("<Control-Up>",          lambda _: self.nudge_roi(0, -1))
+        self.bind_all("<Control-Down>",        lambda _: self.nudge_roi(0, 1))
+        self.bind_all("<Control-Shift-Left>",  lambda _: self.nudge_roi(-10, 0))
+        self.bind_all("<Control-Shift-Right>", lambda _: self.nudge_roi(10, 0))
+        self.bind_all("<Control-Shift-Up>",    lambda _: self.nudge_roi(0, -10))
+        self.bind_all("<Control-Shift-Down>",  lambda _: self.nudge_roi(0, 10))
 
     # ------------------------------------------------------------------
     # Video
@@ -207,6 +230,11 @@ class App(tk.Tk):
         frame = self._get_frame(index)
         if frame is not None:
             self.canvas.set_browse_frame(frame)
+        # Sync ROI overlay with current mode
+        if self._roi_mode == "fixed_roi_crop":
+            self.canvas.set_roi(self._roi_x, self._roi_y, self._roi_w, self._roi_h)
+        else:
+            self.canvas.clear_roi()
         t = index / info.fps if info.fps > 0 else 0.0
         self.set_status(f"Frame {index}/{info.frame_count-1}  t={t:.2f}s")
 
@@ -281,6 +309,25 @@ class App(tk.Tk):
             messagebox.showinfo("Already queued", f"{sid} is already in the queue.")
             return
 
+        frame = self._get_frame(idx)
+        if frame is None:
+            messagebox.showerror("Frame unavailable", f"Cannot load frame {idx}.")
+            return
+
+        # Determine ROI export geometry
+        is_roi = self._roi_mode == "fixed_roi_crop"
+        if is_roi:
+            rx, ry, rw, rh = self._clamped_roi(info.width, info.height)
+            save_frame = frame[ry:ry + rh, rx:rx + rw]
+            roi_mode_val = "fixed_roi_crop"
+            roi_policy = self._roi_size_policy
+        else:
+            rx, ry = 0, 0
+            rw, rh = info.width, info.height
+            save_frame = frame
+            roi_mode_val = "full_frame"
+            roi_policy = "none"
+
         rec = FrameRecord(
             sample_id=sid,
             video_path=str(info.path),
@@ -290,17 +337,20 @@ class App(tk.Tk):
             fps=info.fps,
             episode_id=ep,
             camera_id=cam,
+            is_roi_crop=is_roi,
+            roi_mode=roi_mode_val,
+            roi_size_policy=roi_policy,
+            roi_x=rx,
+            roi_y=ry,
+            roi_width=rw,
+            roi_height=rh,
         )
         self.metadata.add(rec)
-
-        # Save source-resolution image immediately
-        frame = self._get_frame(idx)
-        if frame is not None:
-            self.dataset.save_image(sid, frame)
-
+        self.dataset.save_image(sid, save_frame)
         self.metadata.save()
         self.frame_queue.refresh()
-        self.set_status(f"Added frame {idx} → {sid}")
+        mode_str = f"ROI {rw}\u00d7{rh} @ ({rx},{ry})" if is_roi else "full frame"
+        self.set_status(f"Added frame {idx} \u2192 {sid}  [{mode_str}]")
 
     # ------------------------------------------------------------------
     # Labeling
@@ -323,29 +373,30 @@ class App(tk.Tk):
 
         self._active_sample_id = sample_id
 
-        # Load frame from the record's specific video — never use the browse cache
-        # directly, because the user may have opened a different video since this
-        # frame was queued, which would cause the wrong frame to be displayed.
+        # Load the frame image.
+        # For ROI crops the saved image is already the crop — always load from disk
+        # so the canvas receives the right-sized array and mask alignment is exact.
         frame: np.ndarray | None = None
-        vp_path = str(self.video_reader.info.path) if self.video_reader else None
-        if vp_path == rec.video_path:
-            # Current video matches: use the normal (path-keyed) cache.
-            frame = self._get_frame(rec.frame_index)
-        else:
-            # Different video: check its own cache slot, then open it directly.
-            frame = self.frame_cache.get(rec.video_path, rec.frame_index)
-            if frame is None:
-                try:
-                    r = VideoReader(rec.video_path)
-                    frame = r.read_frame(rec.frame_index)
-                    r.close()
-                    if frame is not None:
-                        self.frame_cache.put(rec.video_path, rec.frame_index, frame)
-                except Exception:
-                    pass
-
-        if frame is None:
+        if rec.is_roi_crop:
             frame = self.dataset.load_image(sample_id)
+        else:
+            # Full-frame: try video cache first, fall back to saved image
+            vp_path = str(self.video_reader.info.path) if self.video_reader else None
+            if vp_path == rec.video_path:
+                frame = self._get_frame(rec.frame_index)
+            else:
+                frame = self.frame_cache.get(rec.video_path, rec.frame_index)
+                if frame is None:
+                    try:
+                        r = VideoReader(rec.video_path)
+                        frame = r.read_frame(rec.frame_index)
+                        r.close()
+                        if frame is not None:
+                            self.frame_cache.put(rec.video_path, rec.frame_index, frame)
+                    except Exception:
+                        pass
+            if frame is None:
+                frame = self.dataset.load_image(sample_id)
 
         if frame is None:
             messagebox.showerror("Frame unavailable", f"Cannot load frame for {sample_id}.")
@@ -360,6 +411,87 @@ class App(tk.Tk):
         self.metadata.save()
         self.frame_queue.refresh()
         self.set_status(f"Labeling: {sample_id}  [{rec.label_status}]")
+
+    # ------------------------------------------------------------------
+    # ROI management
+    # ------------------------------------------------------------------
+
+    def _clamped_roi(self, src_w: int, src_h: int) -> tuple[int, int, int, int]:
+        """Return (x, y, w, h) clamped so the ROI fits inside the source frame."""
+        rw = min(self._roi_w, src_w)
+        rh = min(self._roi_h, src_h)
+        rx = max(0, min(self._roi_x, src_w - rw))
+        ry = max(0, min(self._roi_y, src_h - rh))
+        return rx, ry, rw, rh
+
+    def set_roi_mode(self, mode: str) -> None:
+        self._roi_mode = mode
+        if mode == "fixed_roi_crop":
+            self.canvas.set_roi(self._roi_x, self._roi_y, self._roi_w, self._roi_h)
+        else:
+            self.canvas.clear_roi()
+
+    def set_roi_size(self, w: int, h: int) -> None:
+        """Validate and apply new ROI dimensions. Shows error if too large for current video."""
+        if self.video_reader:
+            info = self.video_reader.info
+            if w > info.width or h > info.height:
+                messagebox.showerror(
+                    "ROI too large",
+                    f"ROI {w}\u00d7{h} exceeds source frame {info.width}\u00d7{info.height}.",
+                )
+                return
+        self._roi_w = max(1, w)
+        self._roi_h = max(1, h)
+        # Re-clamp position
+        if self.video_reader:
+            info = self.video_reader.info
+            self._roi_x = min(self._roi_x, max(0, info.width - self._roi_w))
+            self._roi_y = min(self._roi_y, max(0, info.height - self._roi_h))
+        if self._roi_mode == "fixed_roi_crop":
+            self.canvas.set_roi(self._roi_x, self._roi_y, self._roi_w, self._roi_h)
+
+    def clear_roi(self) -> None:
+        self._roi_x = 0
+        self._roi_y = 0
+        self.canvas.clear_roi()
+        if hasattr(self, "roi_panel"):
+            self.roi_panel.update_position_display(0, 0)
+
+    def save_roi_placement(self) -> None:
+        """Display current ROI placement in the status bar."""
+        self.set_status(
+            f"ROI placement: x={self._roi_x}, y={self._roi_y}, "
+            f"w={self._roi_w}, h={self._roi_h}  (used for next Add Frame)"
+        )
+
+    def on_roi_dragged(self, x: int, y: int, w: int, h: int) -> None:
+        """Called by LabelingCanvas when the ROI is drag-repositioned."""
+        self._roi_x = x
+        self._roi_y = y
+        self._roi_w = w
+        self._roi_h = h
+        if hasattr(self, "roi_panel"):
+            self.roi_panel.update_position_display(x, y)
+
+    def nudge_roi(self, dx: int, dy: int) -> None:
+        """Nudge the ROI by (dx, dy) pixels (keyboard shortcut)."""
+        if self._roi_mode != "fixed_roi_crop":
+            return
+        new_x = self._roi_x + dx
+        new_y = self._roi_y + dy
+        if self.video_reader:
+            info = self.video_reader.info
+            new_x = max(0, min(new_x, info.width - self._roi_w))
+            new_y = max(0, min(new_y, info.height - self._roi_h))
+        else:
+            new_x = max(0, new_x)
+            new_y = max(0, new_y)
+        self._roi_x = new_x
+        self._roi_y = new_y
+        self.canvas.set_roi(self._roi_x, self._roi_y, self._roi_w, self._roi_h)
+        if hasattr(self, "roi_panel"):
+            self.roi_panel.update_position_display(self._roi_x, self._roi_y)
 
     def save_current_mask(self) -> None:
         sid = self._active_sample_id

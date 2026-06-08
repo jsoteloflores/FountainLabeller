@@ -121,4 +121,75 @@ def validate_dataset(dataset_root: Path) -> list[ValidationIssue]:
         except (TypeError, ValueError):
             pass
 
+        # ROI geometry checks
+        try:
+            def _safe_int(key: str, default: int = 0) -> int:
+                v = row.get(key, "")
+                if v is None or str(v).strip() in ("nan", "None", ""):
+                    return default
+                return int(float(v))
+
+            is_roi = str(row.get("is_roi_crop", "false")).lower() in ("true", "1", "yes")
+            roi_mode_val = str(row.get("roi_mode", "full_frame")).strip()
+            src_w = _safe_int("source_width")
+            src_h = _safe_int("source_height")
+            rx = _safe_int("roi_x")
+            ry = _safe_int("roi_y")
+            rw = _safe_int("roi_width")
+            rh = _safe_int("roi_height")
+            ew = _safe_int("export_width")
+            eh = _safe_int("export_height")
+
+            if rw <= 0:
+                issues.append(ValidationIssue(sid, "roi_width <= 0", "error"))
+            if rh <= 0:
+                issues.append(ValidationIssue(sid, "roi_height <= 0", "error"))
+            if rx < 0:
+                issues.append(ValidationIssue(sid, "roi_x < 0", "error"))
+            if ry < 0:
+                issues.append(ValidationIssue(sid, "roi_y < 0", "error"))
+            if src_w > 0 and rw > 0 and rx + rw > src_w:
+                issues.append(ValidationIssue(
+                    sid, f"ROI x+w ({rx + rw}) exceeds source_width ({src_w})", "error"
+                ))
+            if src_h > 0 and rh > 0 and ry + rh > src_h:
+                issues.append(ValidationIssue(
+                    sid, f"ROI y+h ({ry + rh}) exceeds source_height ({src_h})", "error"
+                ))
+            if ew <= 0:
+                issues.append(ValidationIssue(sid, "export_width <= 0", "error"))
+            if eh <= 0:
+                issues.append(ValidationIssue(sid, "export_height <= 0", "error"))
+
+            if is_roi and roi_mode_val == "fixed_roi_crop":
+                if rw > 0 and ew != rw:
+                    issues.append(ValidationIssue(
+                        sid, f"export_width ({ew}) != roi_width ({rw})", "error"
+                    ))
+                if rh > 0 and eh != rh:
+                    issues.append(ValidationIssue(
+                        sid, f"export_height ({eh}) != roi_height ({rh})", "error"
+                    ))
+                # Image on disk should match roi dimensions
+                if rw > 0 and rh > 0 and (iw != rw or ih != rh):
+                    issues.append(ValidationIssue(
+                        sid,
+                        f"ROI crop image {iw}\u00d7{ih} does not match roi_width\u00d7roi_height ({rw}\u00d7{rh})",
+                        "error",
+                    ))
+            elif not is_roi:
+                # Full frame: roi_x/roi_y should be 0
+                if rx != 0 or ry != 0:
+                    issues.append(ValidationIssue(
+                        sid, f"full_frame sample has non-zero roi offset ({rx}, {ry})", "warning"
+                    ))
+                if src_w > 0 and rw > 0 and (rw != src_w or rh != src_h):
+                    issues.append(ValidationIssue(
+                        sid,
+                        f"full_frame roi size ({rw}\u00d7{rh}) != source size ({src_w}\u00d7{src_h})",
+                        "warning",
+                    ))
+        except (TypeError, ValueError):
+            pass
+
     return issues
