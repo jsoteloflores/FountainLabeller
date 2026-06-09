@@ -162,3 +162,13 @@ class ROIPanel(ttk.Frame):
         state = "normal" if mode == "fixed_roi_crop" else "disabled"
         self._w_spin.config(state=state)
         self._h_spin.config(state=state)
+
+    def set_size(self, w: int, h: int) -> None:
+        """Sync the W/H spinboxes (called externally when ROI size is restored)."""
+        self._w_var.set(int(w))
+        self._h_var.set(int(h))
+
+    def set_policy(self, policy: str) -> None:
+        """Sync the policy combobox (called externally when ROI policy is restored)."""
+        if policy in ("global_fixed", "camera_fixed"):
+            self._policy_var.set(policy)

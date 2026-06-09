@@ -285,7 +285,60 @@ class App(tk.Tk):
         self.dataset = ds
         self.metadata = MetadataStore(ds.root)
         self.frame_queue.refresh()
+        self._restore_roi_settings()
         self.set_status(f"Dataset opened: {path}")
+
+    def _restore_roi_settings(self) -> None:
+        """Restore ROI size/mode/policy from dataset config or infer from frames.
+
+        Priority:
+          1. standard_roi_size in dataset_config.json (explicitly saved)
+          2. The most common roi_width/roi_height among existing ROI-crop frames
+        """
+        if self.dataset is None:
+            return
+
+        applied_w: int | None = None
+        applied_h: int | None = None
+        policy = self._roi_size_policy
+        source = ""
+
+        # 1. Saved config
+        cfg = self.dataset.read_config()
+        saved = cfg.get("standard_roi_size")
+        if isinstance(saved, dict) and saved.get("width") and saved.get("height"):
+            applied_w = int(saved["width"])
+            applied_h = int(saved["height"])
+            policy = str(saved.get("scope", policy)) if saved.get("scope") in (
+                "global_fixed", "camera_fixed",
+            ) else policy
+            source = "config"
+
+        # 2. Infer from existing frames (most common ROI size)
+        if applied_w is None and self.metadata is not None:
+            from collections import Counter
+            sizes: Counter = Counter()
+            for rec in self.metadata.all_records():
+                if rec.is_roi_crop and rec.roi_width and rec.roi_height:
+                    sizes[(int(rec.roi_width), int(rec.roi_height))] += 1
+            if sizes:
+                (cw, ch), _ = sizes.most_common(1)[0]
+                applied_w, applied_h = cw, ch
+                source = "frames"
+
+        if applied_w and applied_h:
+            self._roi_w = applied_w
+            self._roi_h = applied_h
+            self._roi_size_policy = policy
+            self._roi_mode = "fixed_roi_crop"
+            # Sync UI
+            if hasattr(self, "roi_panel"):
+                self.roi_panel.set_size(applied_w, applied_h)
+                self.roi_panel.set_mode("fixed_roi_crop")
+                self.roi_panel.set_policy(policy)
+            self.set_status(
+                f"ROI size restored from {source}: {applied_w}\u00d7{applied_h}"
+            )
 
     # ------------------------------------------------------------------
     # Frame queue
@@ -450,6 +503,17 @@ class App(tk.Tk):
             self._roi_y = min(self._roi_y, max(0, info.height - self._roi_h))
         if self._roi_mode == "fixed_roi_crop":
             self.canvas.set_roi(self._roi_x, self._roi_y, self._roi_w, self._roi_h)
+        self._persist_roi_size()
+
+    def _persist_roi_size(self) -> None:
+        """Save the current ROI size to dataset_config.json so it's restored later."""
+        if self.dataset is None:
+            return
+        self.dataset.update_config(standard_roi_size={
+            "width": self._roi_w,
+            "height": self._roi_h,
+            "scope": self._roi_size_policy,
+        })
 
     def clear_roi(self) -> None:
         self._roi_x = 0

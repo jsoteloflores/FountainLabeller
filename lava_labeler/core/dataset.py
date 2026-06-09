@@ -164,6 +164,32 @@ class DatasetFolder:
         return self.root.exists()
 
     # ------------------------------------------------------------------
+    # Config read/write
+    # ------------------------------------------------------------------
+
+    def config_path(self) -> Path:
+        return self.root / DATASET_CONFIG_NAME
+
+    def read_config(self) -> dict:
+        """Return the dataset_config.json contents (empty dict if missing/invalid)."""
+        p = self.config_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def write_config(self, cfg: dict) -> None:
+        self.config_path().write_text(json.dumps(cfg, indent=2))
+
+    def update_config(self, **kwargs) -> None:
+        """Merge *kwargs* into the existing config and persist it."""
+        cfg = self.read_config()
+        cfg.update(kwargs)
+        self.write_config(cfg)
+
+    # ------------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------------
 
