@@ -83,16 +83,27 @@ class LabelingCanvas(ttk.Frame):
         # Debounce
         self._redraw_pending: bool = False
 
+        # Fit-on-first-frame: auto-fit when the very first browse frame arrives
+        self._has_fitted: bool = False
+
         self._bind_events()
 
     # ------------------------------------------------------------------
     # Public setters
     # ------------------------------------------------------------------
 
-    def set_browse_frame(self, frame_bgr: np.ndarray) -> None:
+    def set_browse_frame(self, frame_bgr: np.ndarray, fit: bool = False) -> None:
         self._mode = "browse"
+        was_labeling = self._frame is not None and self._mask is not None
         self._frame = frame_bgr
         self._mask = None
+        # Fit on: first frame ever, explicit request (new video), or returning from label mode
+        if fit or not self._has_fitted or was_labeling:
+            h, w = frame_bgr.shape[:2]
+            cw = self._canvas.winfo_width() or 900
+            ch = self._canvas.winfo_height() or 600
+            self.viewport.fit_to_view(w, h, cw, ch)
+            self._has_fitted = True
         self._schedule_redraw()
 
     def set_labeling_frame(

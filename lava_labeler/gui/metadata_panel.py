@@ -246,6 +246,9 @@ class MetadataPanel(ttk.Frame):
     def _apply(self) -> None:
         sid = self._sample_id
         if sid and self.app.metadata:
+            # Save the mask to disk first so pixels are never lost on navigation
+            # and so mask_positive_pixels is accurate before writing metadata.
+            self.app.save_current_mask()
             self.app.metadata.update(
                 sid,
                 label_status=self._status_var.get(),

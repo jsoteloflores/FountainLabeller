@@ -203,7 +203,7 @@ class App(tk.Tk):
             self.current_frame_index = 0
             self._video_info_var.set(info.summary)
             self.title(f"Lava Labeler — {Path(path).name}")
-            self._load_frame(0)
+            self._load_frame(0, fit=True)
         except Exception as exc:
             messagebox.showerror("Cannot open video", str(exc))
 
@@ -219,7 +219,7 @@ class App(tk.Tk):
             self.frame_cache.put(path, index, frame)
         return frame
 
-    def _load_frame(self, index: int) -> None:
+    def _load_frame(self, index: int, fit: bool = False) -> None:
         if self.video_reader is None:
             return
         info = self.video_reader.info
@@ -229,7 +229,7 @@ class App(tk.Tk):
         self._frame_entry_var.set(str(index))
         frame = self._get_frame(index)
         if frame is not None:
-            self.canvas.set_browse_frame(frame)
+            self.canvas.set_browse_frame(frame, fit=fit)
         # Sync ROI overlay with current mode
         if self._roi_mode == "fixed_roi_crop":
             self.canvas.set_roi(self._roi_x, self._roi_y, self._roi_w, self._roi_h)
