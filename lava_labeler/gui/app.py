@@ -9,15 +9,22 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from lava_labeler.core.candidates import Candidate, CandidateQueue
+from lava_labeler.core.config import ProjectConfig, ShortcutConfig
 from lava_labeler.core.dataset import DatasetFolder, make_sample_id
 from lava_labeler.core.frame_cache import FrameCache
+from lava_labeler.core.logging_utils import SessionLogger
 from lava_labeler.core.metadata import FrameRecord, MetadataStore
+from lava_labeler.core.playback import PlaybackController
 from lava_labeler.core.qc import generate_overlay, generate_thumbnail
+from lava_labeler.core.session import SessionRecovery
 from lava_labeler.core.video_io import VideoReader
 from lava_labeler.gui.export_dialog import ExportDialog
 from lava_labeler.gui.frame_queue import FrameQueuePanel
 from lava_labeler.gui.labeling_canvas import LabelingCanvas
+from lava_labeler.gui.labeling_guide import CheatSheetDialog, LabelingGuidePanel
 from lava_labeler.gui.metadata_panel import MetadataPanel
+from lava_labeler.gui.playback_panel import PlaybackPanel
 from lava_labeler.gui.roi_panel import ROIPanel
 from lava_labeler.gui.toolbar import Toolbar
 
@@ -26,7 +33,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Lava Labeler — Fountain Dataset Builder")
-        self.geometry("1400x900")
+        self.geometry("1500x950")
         self.minsize(900, 600)
 
         # Core state
@@ -36,6 +43,21 @@ class App(tk.Tk):
         self.frame_cache = FrameCache()          # 512 MB byte-budgeted LRU
         self.current_frame_index: int = 0
         self._active_sample_id: str | None = None
+
+        # Stage-1 high-throughput state
+        self.project_config: ProjectConfig | None = None
+        self.shortcuts: ShortcutConfig = ShortcutConfig()
+        self.candidates: CandidateQueue | None = None
+        self.recovery: SessionRecovery | None = None
+        self.logger: SessionLogger | None = None
+        self.playback = PlaybackController()
+        self._active_candidate_id: str | None = None
+        self._review_mode: bool = False
+        self._dirty: bool = False
+        self._empty_confirm_done: bool = False
+        self._playback_after_id: str | None = None
+        self._autosave_after_id: str | None = None
+        self._candidate_filter: str = "all"
 
         # ROI state
         self._roi_mode: str = "full_frame"           # "full_frame" | "fixed_roi_crop"
@@ -63,9 +85,13 @@ class App(tk.Tk):
         file_menu.add_command(label="New Dataset…", command=self.new_dataset)
         file_menu.add_command(label="Open Dataset…", command=self.open_dataset)
         file_menu.add_separator()
+        file_menu.add_command(label="Load Candidate Queue…", command=self.open_candidate_queue)
+        file_menu.add_separator()
         file_menu.add_command(label="Save Mask", command=self.save_current_mask, accelerator="Cmd+S")
+        file_menu.add_command(label="Save & Next Candidate", command=self.save_and_next)
         file_menu.add_separator()
         file_menu.add_command(label="Export Dataset…", command=self.open_export_dialog)
+        file_menu.add_command(label="Export Training Manifest", command=self.export_training_manifest)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", command=self.quit_app, accelerator="Cmd+Q")
         menubar.add_cascade(label="File", menu=file_menu)
@@ -74,6 +100,15 @@ class App(tk.Tk):
         edit_menu.add_command(label="Undo", command=self.undo, accelerator="Cmd+Z")
         edit_menu.add_command(label="Redo", command=self.redo, accelerator="Cmd+Shift+Z")
         menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        view_menu = tk.Menu(menubar, tearoff=False)
+        self._review_mode_var = tk.BooleanVar(value=False)
+        view_menu.add_checkbutton(
+            label="Review Mode", variable=self._review_mode_var, command=self.toggle_review_mode
+        )
+        view_menu.add_separator()
+        view_menu.add_command(label="Keyboard Shortcuts…", command=self.show_cheat_sheet)
+        menubar.add_cascade(label="View", menu=view_menu)
 
     def _build_layout(self) -> None:
         # Top toolbar
@@ -91,15 +126,30 @@ class App(tk.Tk):
         main.pack(fill=tk.BOTH, expand=True)
 
         # Right panel
-        right = ttk.Frame(main, width=270)
+        right = ttk.Frame(main, width=290)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=4)
         right.pack_propagate(False)
+
+        # Candidate filter
+        filter_row = ttk.Frame(right)
+        filter_row.pack(fill=tk.X)
+        ttk.Label(filter_row, text="Filter:").pack(side=tk.LEFT)
+        self._filter_var = tk.StringVar(value="all")
+        filter_combo = ttk.Combobox(
+            filter_row, textvariable=self._filter_var, state="readonly", width=14,
+            values=["all", "unlabeled", "needs_review", "hard_negative", "complete"],
+        )
+        filter_combo.pack(side=tk.LEFT, padx=4)
+        filter_combo.bind("<<ComboboxSelected>>", self._on_filter_change)
 
         self.frame_queue = FrameQueuePanel(right, app=self)
         self.frame_queue.pack(fill=tk.BOTH, expand=True)
 
         self.metadata_panel = MetadataPanel(right, app=self)
         self.metadata_panel.pack(fill=tk.X, pady=(4, 0))
+
+        self.labeling_guide = LabelingGuidePanel(right, app=self, start_open=True)
+        self.labeling_guide.pack(fill=tk.X, pady=(4, 0))
 
         # Center canvas
         canvas_frame = ttk.Frame(main)
@@ -108,15 +158,28 @@ class App(tk.Tk):
         self.canvas = LabelingCanvas(canvas_frame, app=self)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
+        # Playback panel
+        self.playback_panel = PlaybackPanel(self, app=self)
+        self.playback_panel.pack(fill=tk.X, padx=4, pady=2)
+        ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
+
         # Bottom timeline
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, padx=4, pady=2)
         self._build_timeline(bottom)
 
-        # Status bar
-        self.status_var = tk.StringVar(value="Ready. Open a video to begin.")
-        ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(
-            fill=tk.X, side=tk.BOTTOM, padx=2
+        # Status bar with save-state indicator
+        status_bar = ttk.Frame(self)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=2)
+        self.save_state_var = tk.StringVar(value="Saved")
+        self._save_state_lbl = ttk.Label(
+            status_bar, textvariable=self.save_state_var, relief=tk.SUNKEN,
+            anchor=tk.W, width=18, foreground="#81c784",
+        )
+        self._save_state_lbl.pack(side=tk.LEFT, padx=(0, 2))
+        self.status_var = tk.StringVar(value="Ready. Open a dataset to begin.")
+        ttk.Label(status_bar, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(
+            fill=tk.X, side=tk.LEFT, expand=True
         )
 
     def _build_timeline(self, parent: ttk.Frame) -> None:
@@ -174,6 +237,89 @@ class App(tk.Tk):
         self.bind_all("<Control-Shift-Right>", lambda _: self.nudge_roi(10, 0))
         self.bind_all("<Control-Shift-Up>",    lambda _: self.nudge_roi(0, -10))
         self.bind_all("<Control-Shift-Down>",  lambda _: self.nudge_roi(0, 10))
+        self._bind_shortcuts()
+
+    # ------------------------------------------------------------------
+    # Configurable keyboard shortcuts
+    # ------------------------------------------------------------------
+
+    def _focus_is_text_entry(self) -> bool:
+        """True when keyboard focus is in a text-entry widget or listbox.
+
+        Used to suppress single-key navigation/metadata shortcuts while the
+        user is typing in episode/camera/notes fields or selecting in a list.
+        """
+        try:
+            w = self.focus_get()
+        except (KeyError, tk.TclError):
+            return False
+        if w is None:
+            return False
+        cls = w.winfo_class()
+        return cls in ("TEntry", "Entry", "TCombobox", "TSpinbox", "Spinbox", "Text", "Listbox")
+
+    def _bind_shortcuts(self) -> None:
+        """Bind every action in the shortcut config to its handler."""
+        handlers = self._shortcut_handlers()
+        for action, handler in handlers.items():
+            seq = self.shortcuts.sequence_for(action)
+            if not seq:
+                continue
+            self.bind_all(seq, self._make_shortcut_callback(handler))
+
+    def _make_shortcut_callback(self, handler):
+        def _cb(event):
+            if self._focus_is_text_entry():
+                return  # let the widget receive the key
+            handler()
+            return "break"
+        return _cb
+
+    def _shortcut_handlers(self) -> dict:
+        return {
+            # Navigation
+            "previous_frame": lambda: self._jump(-1),
+            "next_frame": lambda: self._jump(1),
+            "jump_back_small": lambda: self._jump(-10),
+            "jump_forward_small": lambda: self._jump(10),
+            "jump_back_large": lambda: self._jump(-100),
+            "jump_forward_large": lambda: self._jump(100),
+            "previous_candidate": self.previous_candidate,
+            "next_candidate": self.next_candidate,
+            "save_and_next": self.save_and_next,
+            "save": self.save_current_mask,
+            "force_save": self.force_save,
+            # View
+            "fit_view": self.zoom_fit,
+            "zoom_100": self.zoom_100,
+            "reset_view": self.reset_view,
+            "toggle_mask": self.toggle_mask_overlay,
+            "toggle_playback_panel": self.toggle_playback_panel,
+            "toggle_metadata_panel": self.toggle_metadata_panel,
+            "cheat_sheet": self.show_cheat_sheet,
+            # Playback
+            "play_pause": self.toggle_playback,
+            # Drawing
+            "brush": lambda: self.set_tool("brush"),
+            "eraser": lambda: self.set_tool("eraser"),
+            "otsu_brush": lambda: self.set_tool("otsu_brush"),
+            "undo": self.undo,
+            "redo": self.redo,
+            "clear_mask": self.clear_mask,
+            "mark_empty": self.mark_empty,
+            # Metadata toggles
+            "toggle_wind_affected": lambda: self.toggle_metadata_flag("wind_affected"),
+            "toggle_falling_tephra_visible": lambda: self.toggle_metadata_flag("falling_tephra_visible"),
+            "toggle_cooling_tephra_visible": lambda: self.toggle_metadata_flag("cooling_tephra_visible"),
+            "toggle_smoke_obscured": lambda: self.toggle_metadata_flag("smoke_obscured"),
+            "toggle_ground_glow_visible": lambda: self.toggle_metadata_flag("ground_glow_visible"),
+            "toggle_exposure_bloom": lambda: self.toggle_metadata_flag("exposure_bloom"),
+            "toggle_ambiguous_boundary": lambda: self.toggle_metadata_flag("ambiguous_boundary"),
+            "toggle_hard_negative": self.mark_hard_negative,
+            "approve_human_clean": self.approve_human_clean,
+            "mark_needs_review": self.mark_needs_review,
+            "toggle_model_draft_corrected": lambda: self.toggle_metadata_flag("model_draft_corrected"),
+        }
 
     # ------------------------------------------------------------------
     # Video
@@ -269,6 +415,7 @@ class App(tk.Tk):
         ds.create(name=Path(path).name)
         self.dataset = ds
         self.metadata = MetadataStore(ds.root)
+        self._init_session(ds.root)
         self.frame_queue.refresh()
         self.set_status(f"Dataset created: {path}")
 
@@ -284,9 +431,65 @@ class App(tk.Tk):
             return
         self.dataset = ds
         self.metadata = MetadataStore(ds.root)
+        self._init_session(ds.root)
         self.frame_queue.refresh()
         self._restore_roi_settings()
         self.set_status(f"Dataset opened: {path}")
+        self._maybe_resume_session()
+
+    def _init_session(self, root) -> None:
+        """Load project config, shortcuts, recovery, logger for a dataset."""
+        self.project_config = ProjectConfig.load(root)
+        shortcut_file = str(self.project_config.get("shortcut_config_path", "shortcuts.json"))
+        self.shortcuts = ShortcutConfig.load(root, Path(shortcut_file).name)
+        self._bind_shortcuts()  # rebind in case the user customised shortcuts.json
+        self.recovery = SessionRecovery(root)
+        self.logger = SessionLogger(root)
+        self._empty_confirm_done = False
+        # Apply config defaults to playback + cache + overlay.
+        self.playback.loop_radius = int(self.project_config.get("default_loop_radius_frames", 15))
+        self.playback.speed = float(self.project_config.get("default_playback_speed", 0.5))
+        if hasattr(self, "playback_panel"):
+            self.playback_panel.loop_radius_var.set(self.playback.loop_radius)
+            self.playback_panel.speed_var.set(self.playback.speed)
+        opacity = float(self.project_config.get("default_mask_opacity", 0.4))
+        self.canvas.set_mask_alpha(opacity)
+        if hasattr(self, "toolbar") and hasattr(self.toolbar, "_opacity_var"):
+            self.toolbar._opacity_var.set(opacity)
+        # Auto-load a candidate queue if one lives in the dataset folder.
+        for name in ("candidate_frames.csv", "candidate_frames.json"):
+            cand_path = Path(root) / name
+            if cand_path.exists():
+                self.candidates = CandidateQueue.load(cand_path)
+                self.set_status(f"Loaded {len(self.candidates)} candidates from {name}")
+                break
+
+    def _maybe_resume_session(self) -> None:
+        """Offer to resume the previous candidate/frame after a crash."""
+        if self.recovery is None or not self.recovery.has_resumable_state():
+            return
+        cand_id = self.recovery.get("candidate_id", "")
+        sid = self.recovery.get("active_sample_id", "")
+        label = cand_id or sid
+        if not label:
+            return
+        if not messagebox.askyesno(
+            "Resume session",
+            f"A previous session was interrupted.\n\nResume from:\n  {label}\n\n"
+            "Yes → reopen it.   No → start fresh.",
+        ):
+            return
+        # Restore candidate queue if it was loaded.
+        q_path = self.recovery.get("candidate_queue_path", "")
+        if q_path and Path(q_path).exists() and self.candidates is None:
+            self.candidates = CandidateQueue.load(q_path)
+        if cand_id and self.candidates is not None:
+            cand = self.candidates.get(cand_id)
+            if cand is not None:
+                self.open_candidate(cand)
+                return
+        if sid and self.metadata and self.metadata.get(sid) is not None:
+            self.open_frame_for_labeling(sid)
 
     def _restore_roi_settings(self) -> None:
         """Restore ROI size/mode/policy from dataset config or infer from frames.
@@ -463,6 +666,22 @@ class App(tk.Tk):
             self.metadata.update(sample_id, label_status="in_progress")
         self.metadata.save()
         self.frame_queue.refresh()
+        self.mark_clean()
+        # Anchor playback on this frame's index and stop any active preview.
+        self._stop_playback()
+        if self.video_reader is not None:
+            self.playback.fps = self.video_reader.info.fps
+            self.playback.set_anchor(rec.frame_index, self.video_reader.info.frame_count - 1)
+        self.current_frame_index = rec.frame_index
+        self._update_playback_info()
+        if self.recovery is not None:
+            self.recovery.update(
+                active_sample_id=sample_id,
+                video_path=rec.video_path,
+                frame_index=rec.frame_index,
+                candidate_id=self._active_candidate_id or "",
+            )
+            self.recovery.save()
         self.set_status(f"Labeling: {sample_id}  [{rec.label_status}]")
 
     # ------------------------------------------------------------------
@@ -577,11 +796,13 @@ class App(tk.Tk):
         self.canvas.mark_saved()
 
         # QC outputs
-        frame = self.canvas.get_current_frame()
+        frame = self.canvas.get_label_frame()
         if frame is not None:
             generate_overlay(frame, mask, self.dataset.qc_overlay_path(sid))
             generate_thumbnail(frame, mask, self.dataset.qc_thumb_path(sid))
 
+        self.mark_clean()
+        self._log_event("save_mask", details=f"{pos_pixels}px")
         self.set_status(f"Saved {sid}  ({pos_pixels} positive px, {pos_pixels/total*100:.1f}%)")
 
     def warn_if_empty_mask_complete(self) -> bool:
@@ -705,6 +926,595 @@ class App(tk.Tk):
         self.status_var.set(msg)
 
     # ------------------------------------------------------------------
+    # Dirty state / save indicator
+    # ------------------------------------------------------------------
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+        self.save_state_var.set("Unsaved changes")
+        self._save_state_lbl.config(foreground="#e57373")
+        if self.recovery is not None:
+            self.recovery.update(dirty=True)
+        self._schedule_autosave()
+
+    def mark_clean(self) -> None:
+        self._dirty = False
+        self.save_state_var.set("Saved")
+        self._save_state_lbl.config(foreground="#81c784")
+        if self.recovery is not None:
+            self.recovery.mark_saved()
+            self.recovery.save()
+
+    def _schedule_autosave(self) -> None:
+        if self._autosave_after_id is not None:
+            return
+        interval = 10
+        if self.project_config is not None:
+            interval = int(self.project_config.get("autosave_interval_seconds", 10))
+        self._autosave_after_id = self.after(max(1000, interval * 1000), self._autosave_tick)
+
+    def _autosave_tick(self) -> None:
+        self._autosave_after_id = None
+        if not self._dirty:
+            return
+        try:
+            self.save_state_var.set("Autosaving…")
+            self.update_idletasks()
+            self._autosave_now()
+            self.mark_clean()
+            self._log_event("autosave_mask")
+        except Exception:
+            self.save_state_var.set("Autosave failed")
+            self._save_state_lbl.config(foreground="#e57373")
+
+    def _autosave_now(self) -> None:
+        """Persist the current mask + metadata without UI side effects."""
+        if self._active_sample_id and self.dataset and self.metadata:
+            mask = self.canvas.get_current_mask()
+            if mask is not None:
+                pos = int(np.sum(mask > 0))
+                total = int(mask.size)
+                self.dataset.save_mask(self._active_sample_id, mask)
+                self.metadata.update(
+                    self._active_sample_id,
+                    mask_positive_pixels=pos,
+                    mask_positive_fraction=pos / total if total else 0.0,
+                )
+                self.canvas.mark_saved()
+            self.metadata.save()
+
+    # ------------------------------------------------------------------
+    # Logging helper
+    # ------------------------------------------------------------------
+
+    def _log_event(self, event_type: str, details: str = "") -> None:
+        if self.logger is None:
+            return
+        rec = self.metadata.get(self._active_sample_id) if (self.metadata and self._active_sample_id) else None
+        self.logger.log(
+            event_type,
+            candidate_id=self._active_candidate_id or "",
+            video_id=rec.video_id if rec else "",
+            frame_index=rec.frame_index if rec else self.current_frame_index,
+            details=details,
+        )
+
+    # ------------------------------------------------------------------
+    # Tool / view shortcuts
+    # ------------------------------------------------------------------
+
+    def set_tool(self, tool: str) -> None:
+        self.canvas.set_tool(tool)
+        if hasattr(self, "toolbar") and hasattr(self.toolbar, "_tool_var"):
+            self.toolbar._tool_var.set(tool)
+        self.set_status(f"Tool: {tool}")
+
+    def reset_view(self) -> None:
+        self.canvas.zoom_fit()
+
+    def toggle_mask_overlay(self) -> None:
+        new_state = not self.canvas._mask_visible
+        self.canvas.set_mask_visible(new_state)
+        self.set_status(f"Mask overlay: {'ON' if new_state else 'OFF'}")
+
+    def toggle_playback_panel(self) -> None:
+        if self.playback_panel.winfo_ismapped():
+            self.playback_panel.pack_forget()
+        else:
+            self.playback_panel.pack(fill=tk.X, padx=4, pady=2)
+
+    def toggle_metadata_panel(self) -> None:
+        if self.metadata_panel.winfo_ismapped():
+            self.metadata_panel.pack_forget()
+        else:
+            self.metadata_panel.pack(fill=tk.X, pady=(4, 0))
+
+    def show_cheat_sheet(self) -> None:
+        CheatSheetDialog(self, self.shortcuts)
+
+    def toggle_review_mode(self) -> None:
+        self._review_mode = self._review_mode_var.get()
+        self.set_status(f"Review mode: {'ON' if self._review_mode else 'OFF'}")
+
+    def clear_mask(self) -> None:
+        if self._active_sample_id is None:
+            return
+        self.canvas.clear_mask()
+        self.mark_dirty()
+        self.set_status("Mask cleared (undo with Ctrl+Z)")
+
+    # ------------------------------------------------------------------
+    # Metadata flag hotkeys
+    # ------------------------------------------------------------------
+
+    def toggle_metadata_flag(self, flag: str) -> None:
+        if self._active_sample_id is None or self.metadata is None:
+            self.set_status("Open a frame before tagging metadata.")
+            return
+        new_val = self.metadata_panel.toggle_flag(flag)
+        if new_val is None:
+            return
+        self.apply_flag(flag, new_val)
+
+    def apply_flag(self, flag: str, value: bool) -> None:
+        """Persist a single metadata flag immediately and autosave."""
+        if self._active_sample_id is None or self.metadata is None:
+            return
+        self.metadata.update(self._active_sample_id, **{flag: value})
+        self.metadata.save()
+        self.frame_queue.refresh()
+        self.mark_clean()
+        self._log_event("toggle_metadata", details=f"{flag}={'ON' if value else 'OFF'}")
+        self.set_status(f"{flag}: {'ON' if value else 'OFF'}")
+
+    def mark_hard_negative(self) -> None:
+        if self._active_sample_id is None or self.metadata is None:
+            return
+        new_val = self.metadata_panel.toggle_flag("hard_negative")
+        if new_val is None:
+            return
+        self.apply_flag("hard_negative", new_val)
+        if new_val:
+            self.metadata.update(self._active_sample_id, label_status="hard_negative")
+            self.metadata.save()
+            self.metadata_panel.set_status_value("hard_negative")
+            self._update_candidate_status_from_record()
+            self.frame_queue.refresh()
+        self._log_event("mark_hard_negative")
+
+    def approve_human_clean(self) -> None:
+        if self._active_sample_id is None or self.metadata is None:
+            return
+        self.save_current_mask()
+        self.metadata_panel.set_flag("human_clean", True)
+        self.metadata.update(
+            self._active_sample_id, human_clean=True,
+            label_status="complete", mask_provenance="human_clean",
+        )
+        self.metadata.save()
+        self.metadata_panel.set_status_value("complete")
+        self.metadata_panel.set_provenance("human_clean")
+        self._update_candidate_status_from_record()
+        self.frame_queue.refresh()
+        self.mark_clean()
+        self._log_event("approve_mask")
+        self.set_status("Approved: human_clean")
+
+    def mark_needs_review(self) -> None:
+        if self._active_sample_id is None or self.metadata is None:
+            return
+        self.metadata_panel.set_flag("needs_review", True)
+        self.metadata.update(
+            self._active_sample_id, needs_review=True, label_status="needs_review",
+        )
+        self.metadata.save()
+        self.metadata_panel.set_status_value("needs_review")
+        self._update_candidate_status_from_record()
+        self.frame_queue.refresh()
+        self.mark_clean()
+        self._log_event("needs_review")
+        self.set_status("Marked needs_review")
+
+    def mark_empty(self) -> None:
+        """Mark the current frame as an intentionally-empty (true-negative) label."""
+        if self._active_sample_id is None or self.metadata is None:
+            self.set_status("Open a frame first.")
+            return
+        # One-time-per-session confirmation, then fast marking with undo support.
+        require_confirm = True
+        if self.project_config is not None:
+            require_confirm = bool(
+                self.project_config.get("require_empty_mask_confirmation_once_per_session", True)
+            )
+        if require_confirm and not self._empty_confirm_done:
+            ans = messagebox.askyesno(
+                "Mark intentionally empty",
+                "Mark this frame as an intentionally-empty (true-negative) label?\n\n"
+                "This clears the mask. You can undo with Ctrl+Z.\n\n"
+                "Marking empty will not ask again this session.",
+            )
+            if not ans:
+                return
+            self._empty_confirm_done = True
+
+        self.canvas.clear_mask()
+        self.dataset.save_mask(self._active_sample_id, self.canvas.get_current_mask())
+        self.metadata_panel.set_flag("empty_mask_confirmed", True)
+        # Preserve hard_negative status if already set; otherwise empty_confirmed.
+        rec = self.metadata.get(self._active_sample_id)
+        new_status = "hard_negative" if (rec and rec.hard_negative) else "empty_confirmed"
+        self.metadata.update(
+            self._active_sample_id,
+            empty_mask_confirmed=True,
+            mask_provenance="empty_confirmed",
+            label_status=new_status,
+            mask_positive_pixels=0,
+            mask_positive_fraction=0.0,
+        )
+        self.metadata.save()
+        self.metadata_panel.set_status_value(new_status)
+        self.metadata_panel.set_provenance("empty_confirmed")
+        self.canvas.mark_saved()
+        self._update_candidate_status_from_record()
+        self.frame_queue.refresh()
+        self.mark_clean()
+        self._log_event("mark_empty")
+        self.set_status(f"Marked intentionally empty ({new_status})")
+
+    def force_save(self) -> None:
+        self.save_current_mask()
+        if self.metadata is not None:
+            self.metadata.save()
+        if self.recovery is not None:
+            self.recovery.save()
+        self.set_status("Project saved.")
+
+    # ------------------------------------------------------------------
+    # Candidate queue
+    # ------------------------------------------------------------------
+
+    def open_candidate_queue(self) -> None:
+        if self.dataset is None or self.metadata is None:
+            messagebox.showwarning("No dataset", "Create or open a dataset first.")
+            return
+        path = filedialog.askopenfilename(
+            title="Open Candidate Queue",
+            filetypes=[("Candidate files", "*.csv *.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.candidates = CandidateQueue.load(path)
+        if self.recovery is not None:
+            self.recovery.update(candidate_queue_path=path)
+            self.recovery.save()
+        self.set_status(f"Loaded {len(self.candidates)} candidates from {Path(path).name}")
+        first = self.candidates.first_unlabeled()
+        if first is not None:
+            self.open_candidate(first)
+
+    def open_candidate(self, candidate: "Candidate") -> None:
+        """Ensure a dataset record/image exists for *candidate*, then label it."""
+        if self.dataset is None or self.metadata is None:
+            return
+        if not self._check_unsaved(context="before opening another candidate"):
+            return
+        # Ensure the candidate's video is open.
+        if not self._ensure_video(candidate.video_path):
+            messagebox.showerror("Video unavailable", f"Cannot open:\n{candidate.video_path}")
+            return
+        sid = self._ensure_record_for_candidate(candidate)
+        if sid is None:
+            return
+        self._active_candidate_id = candidate.candidate_id
+        if candidate.status == "unlabeled":
+            self.candidates.set_status(candidate.candidate_id, "in_progress")
+            self._save_candidates()
+        if self.recovery is not None:
+            self.recovery.update(candidate_id=candidate.candidate_id)
+            self.recovery.push_recent(candidate.candidate_id)
+        self.open_frame_for_labeling(sid)
+        self._log_event("open_candidate", details=candidate.reason)
+
+    def _ensure_video(self, video_path: str) -> bool:
+        if not video_path:
+            return self.video_reader is not None
+        cur = str(self.video_reader.info.path) if self.video_reader else None
+        if cur == video_path:
+            return True
+        if not Path(video_path).exists():
+            return self.video_reader is not None  # fall back to whatever is open
+        try:
+            if self.video_reader:
+                self.video_reader.close()
+            self.video_reader = VideoReader(video_path)
+            self.frame_cache.clear()
+            info = self.video_reader.info
+            self._scrubber.configure(to=max(1, info.frame_count - 1))
+            self._video_info_var.set(info.summary)
+            self.title(f"Lava Labeler — {Path(video_path).name}")
+            return True
+        except Exception:
+            return False
+
+    def _ensure_record_for_candidate(self, candidate: "Candidate") -> str | None:
+        """Create (or fetch) the FrameRecord + image for a candidate frame."""
+        if self.video_reader is None or self.dataset is None or self.metadata is None:
+            return None
+        info = self.video_reader.info
+        idx = max(0, min(info.frame_count - 1, candidate.frame_index))
+        ep = candidate.extra.get("eruption_episode", "") or self.metadata_panel.episode_var.get() or "unknownEpisode"
+        cam = candidate.camera_id or self.metadata_panel.camera_var.get() or "unknownCamera"
+        sid = make_sample_id(ep, cam, idx)
+        if self.metadata.get(sid) is not None:
+            return sid
+        frame = self._get_frame(idx)
+        if frame is None:
+            messagebox.showerror("Frame unavailable", f"Cannot load frame {idx}.")
+            return None
+        rec = FrameRecord(
+            sample_id=sid,
+            video_path=str(info.path),
+            frame_index=idx,
+            source_width=info.width,
+            source_height=info.height,
+            fps=info.fps,
+            video_id=candidate.video_id,
+            episode_id=ep,
+            camera_id=cam,
+            candidate_id=candidate.candidate_id,
+            roi_x=0, roi_y=0, roi_width=info.width, roi_height=info.height,
+            lighting_condition=candidate.extra.get("lighting_condition", "unknown") or "unknown",
+            notes=candidate.notes,
+        )
+        self.metadata.add(rec)
+        self.dataset.save_image(sid, frame)
+        self.metadata.save()
+        self.frame_queue.refresh()
+        return sid
+
+    def _current_candidate(self) -> "Candidate | None":
+        if self.candidates is None or self._active_candidate_id is None:
+            return None
+        return self.candidates.get(self._active_candidate_id)
+
+    def next_candidate(self) -> None:
+        if self.candidates is None:
+            self.set_status("No candidate queue loaded.")
+            return
+        nxt = self.candidates.next(self._active_candidate_id)
+        if nxt is None:
+            self.set_status("No more candidates.")
+            return
+        self.open_candidate(nxt)
+
+    def previous_candidate(self) -> None:
+        if self.candidates is None:
+            self.set_status("No candidate queue loaded.")
+            return
+        prv = self.candidates.previous(self._active_candidate_id)
+        if prv is None:
+            self.set_status("At first candidate.")
+            return
+        self.open_candidate(prv)
+
+    def save_and_next(self) -> None:
+        """Save the current frame, update candidate status, jump to next unlabeled."""
+        if self._active_sample_id is not None:
+            self.save_current_mask()
+            self._finalize_current_label_status()
+            self._update_candidate_status_from_record()
+            self._save_candidates()
+            self.mark_clean()
+        if self.candidates is None:
+            self.set_status("Saved. (No candidate queue loaded.)")
+            return
+        nxt = self.candidates.next_unlabeled(self._active_candidate_id)
+        if nxt is None:
+            self.set_status("Saved. No more unlabeled candidates.")
+            return
+        self.open_candidate(nxt)
+
+    def _finalize_current_label_status(self) -> None:
+        """Promote in_progress frames to a terminal status based on content."""
+        if self._active_sample_id is None or self.metadata is None:
+            return
+        rec = self.metadata.get(self._active_sample_id)
+        if rec is None:
+            return
+        if rec.label_status in ("queued", "in_progress"):
+            if rec.hard_negative and rec.empty_mask_confirmed:
+                new = "hard_negative"
+            elif rec.needs_review:
+                new = "needs_review"
+            elif rec.mask_positive_pixels > 0:
+                new = "complete"
+                if rec.mask_provenance in ("human_rough", "unknown", ""):
+                    self.metadata.update(self._active_sample_id, mask_provenance="human_clean")
+            elif rec.empty_mask_confirmed:
+                new = "empty_confirmed"
+            else:
+                new = rec.label_status  # leave as-is if nothing decisive
+            self.metadata.update(self._active_sample_id, label_status=new)
+            self.metadata.save()
+            self.metadata_panel.set_status_value(new)
+
+    def _update_candidate_status_from_record(self) -> None:
+        """Sync the candidate queue status from the active frame record."""
+        if self.candidates is None or self._active_candidate_id is None or self.metadata is None:
+            return
+        rec = self.metadata.get(self._active_sample_id) if self._active_sample_id else None
+        if rec is None:
+            return
+        mapping = {
+            "complete": "labeled",
+            "hard_negative": "hard_negative",
+            "empty_confirmed": "empty_confirmed",
+            "needs_review": "needs_review",
+            "bad_frame": "bad_frame",
+            "skipped": "skipped",
+        }
+        status = mapping.get(rec.label_status)
+        if status:
+            self.candidates.set_status(self._active_candidate_id, status)
+
+    def _save_candidates(self) -> None:
+        if self.candidates is not None:
+            self.candidates.save()
+
+    def _on_filter_change(self, _event=None) -> None:
+        self._candidate_filter = self._filter_var.get()
+        self.frame_queue.set_filter(self._candidate_filter)
+
+    # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
+
+    def toggle_playback(self) -> None:
+        if self.playback.is_playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self) -> None:
+        if self.video_reader is None:
+            self.set_status("Open a video to play.")
+            return
+        info = self.video_reader.info
+        # Anchor on the active label frame if labeling, else the browse frame.
+        anchor = self.current_frame_index
+        if self._active_sample_id and self.metadata:
+            rec = self.metadata.get(self._active_sample_id)
+            if rec is not None:
+                anchor = rec.frame_index
+        self.playback.fps = info.fps
+        self.playback.set_anchor(anchor, info.frame_count - 1)
+        self.playback.is_playing = True
+        self.playback_panel.set_playing(True)
+        self._log_event("playback_start")
+        self._playback_tick()
+
+    def _stop_playback(self) -> None:
+        self.playback.is_playing = False
+        if self._playback_after_id is not None:
+            try:
+                self.after_cancel(self._playback_after_id)
+            except Exception:
+                pass
+            self._playback_after_id = None
+        self.playback_panel.set_playing(False)
+        # Restore the anchored label frame / browse frame.
+        if self.canvas.is_previewing:
+            self.canvas.end_preview()
+        self._update_playback_info()
+        self._log_event("playback_stop")
+
+    def _playback_tick(self) -> None:
+        if not self.playback.is_playing or self.video_reader is None:
+            return
+        idx = self.playback.next_frame()
+        frame = self._get_frame(idx)
+        if frame is not None:
+            info = self.video_reader.info
+            t = idx / info.fps if info.fps > 0 else 0.0
+            if self.canvas._mode == "label" and idx != self.playback.anchor_frame:
+                banner = (
+                    f"Previewing frame {idx} (t={t:.2f}s)  —  "
+                    f"Editing mask for frame {self.playback.anchor_frame}"
+                )
+                self.canvas.show_preview(frame, banner)
+            elif self.canvas._mode == "label":
+                # Reached the anchor: show the real label frame + mask.
+                self.canvas.end_preview()
+            else:
+                self.canvas.set_browse_frame(frame)
+            self._update_playback_info()
+        self._playback_after_id = self.after(self.playback.interval_ms(), self._playback_tick)
+
+    def playback_step(self, delta: int) -> None:
+        """Step the preview frame by *delta* without starting continuous play."""
+        if self.video_reader is None:
+            return
+        if not self.canvas._mode == "label":
+            self._jump(delta)
+            return
+        if not self.playback.max_frame:
+            info = self.video_reader.info
+            anchor = self.current_frame_index
+            if self._active_sample_id and self.metadata:
+                rec = self.metadata.get(self._active_sample_id)
+                if rec is not None:
+                    anchor = rec.frame_index
+            self.playback.set_anchor(anchor, info.frame_count - 1)
+        target = max(0, min(self.playback.max_frame, self.playback.preview_frame + delta))
+        self.playback.preview_frame = target
+        frame = self._get_frame(target)
+        if frame is None:
+            return
+        if target == self.playback.anchor_frame:
+            self.canvas.end_preview()
+        else:
+            info = self.video_reader.info
+            t = target / info.fps if info.fps > 0 else 0.0
+            self.canvas.show_preview(
+                frame,
+                f"Previewing frame {target} (t={t:.2f}s)  —  "
+                f"Editing mask for frame {self.playback.anchor_frame}",
+            )
+        self._update_playback_info()
+
+    def playback_reset(self) -> None:
+        """Stop playback and return to the anchored label frame."""
+        self._stop_playback()
+        self.playback.reset_to_anchor()
+        if self.canvas.is_previewing:
+            self.canvas.end_preview()
+        self._update_playback_info()
+
+    def set_loop_radius(self, n: int) -> None:
+        self.playback.loop_radius = max(0, n)
+
+    def set_loop_enabled(self, enabled: bool) -> None:
+        self.playback.loop_enabled = enabled
+
+    def set_playback_speed(self, speed: float) -> None:
+        self.playback.speed = max(0.05, speed)
+
+    def _update_playback_info(self) -> None:
+        if self.canvas._mode == "label" and self._active_sample_id:
+            anchor = self.playback.anchor_frame
+            preview = self.playback.preview_frame
+            if preview != anchor and self.canvas.is_previewing:
+                self.playback_panel.set_info(
+                    f"Preview {preview}  |  Editing {anchor}", previewing=True
+                )
+            else:
+                self.playback_panel.set_info(f"Editing frame {anchor}", previewing=False)
+        else:
+            self.playback_panel.set_info(f"Frame {self.current_frame_index}", previewing=False)
+
+    # ------------------------------------------------------------------
+    # Training export
+    # ------------------------------------------------------------------
+
+    def export_training_manifest(self) -> None:
+        if self.dataset is None or self.metadata is None:
+            messagebox.showwarning("No dataset", "Open a dataset first.")
+            return
+        from lava_labeler.core.export import export_dataset
+        try:
+            summary = export_dataset(self.dataset, self.metadata)
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        messagebox.showinfo(
+            "Export complete",
+            f"Exported {summary['exported']} samples.\n"
+            f"Skipped (not finalized): {summary['skipped']}\n\n"
+            f"Manifest:\n{summary['manifest']}",
+        )
+        self.set_status(f"Exported {summary['exported']} samples → labels_manifest.csv")
+
+    # ------------------------------------------------------------------
     # Unsaved-changes guard
     # ------------------------------------------------------------------
 
@@ -736,8 +1546,19 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
 
     def quit_app(self) -> None:
+        # Best-effort autosave of any pending edits before the guard prompt.
+        if self._dirty:
+            try:
+                self._autosave_now()
+                self.mark_clean()
+            except Exception:
+                pass
         if not self._check_unsaved(context="before quitting"):
             return
+        self._stop_playback()
+        if self.recovery is not None:
+            # Clean exit: drop the recovery file so we don't prompt next time.
+            self.recovery.clear()
         if self.video_reader:
             self.video_reader.close()
         self.destroy()

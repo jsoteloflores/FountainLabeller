@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from lava_labeler.core.metadata import (
     FrameRecord, DIFFICULTIES, LIGHTING_CONDITIONS, LABEL_STATUSES,
+    METADATA_FLAGS, MASK_PROVENANCES,
 )
 
 if TYPE_CHECKING:
@@ -153,9 +154,51 @@ class MetadataPanel(ttk.Frame):
             row=9, column=0, columnspan=2, **PAD, sticky=tk.W
         )
 
+        # Mask provenance
+        ttk.Label(self._frame_section, text="Provenance:").grid(
+            row=10, column=0, **PAD, **sticky_ew
+        )
+        self._provenance_var = tk.StringVar(value="human_rough")
+        ttk.Combobox(
+            self._frame_section, textvariable=self._provenance_var, values=MASK_PROVENANCES,
+            state="readonly", width=13,
+        ).grid(row=10, column=1, **PAD, **sticky_ew)
+
+        # ── Per-frame metadata flags (hotkey-toggleable) ──────────────
+        flags_box = ttk.LabelFrame(self._frame_section, text="Flags (hotkeys)")
+        flags_box.grid(row=11, column=0, columnspan=2, padx=2, pady=4, sticky=tk.EW)
+        flags_box.columnconfigure(0, weight=1)
+        flags_box.columnconfigure(1, weight=1)
+
+        self._flag_vars: dict[str, tk.BooleanVar] = {}
+        # Short labels for compactness; full names are the metadata field names.
+        flag_labels = {
+            "wind_affected": "Wind (W)",
+            "falling_tephra_visible": "Falling (T)",
+            "cooling_tephra_visible": "Cooling (⇧C)",
+            "smoke_obscured": "Smoke (K)",
+            "ground_glow_visible": "Grnd glow (G)",
+            "exposure_bloom": "Bloom (L)",
+            "ambiguous_boundary": "Ambig (U)",
+            "hard_negative": "Hard-neg (N)",
+            "empty_mask_confirmed": "Empty (0)",
+            "needs_review": "Review (J)",
+            "bad_frame": "Bad frame",
+            "model_draft_present": "Draft present",
+            "model_draft_corrected": "Draft corr (P)",
+            "human_clean": "Clean (Y)",
+        }
+        for i, flag in enumerate(METADATA_FLAGS):
+            var = tk.BooleanVar(value=False)
+            self._flag_vars[flag] = var
+            ttk.Checkbutton(
+                flags_box, text=flag_labels.get(flag, flag), variable=var,
+                command=lambda f=flag: self._on_flag_checkbox(f),
+            ).grid(row=i // 2, column=i % 2, padx=2, pady=1, sticky=tk.W)
+
         # Action buttons
         btn_frame = ttk.Frame(self._frame_section)
-        btn_frame.grid(row=10, column=0, columnspan=2, pady=4)
+        btn_frame.grid(row=20, column=0, columnspan=2, pady=4)
         ttk.Button(btn_frame, text="Apply", command=self._apply).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Complete",
                    command=lambda: self._set_status("complete")).pack(side=tk.LEFT, padx=2)
@@ -184,6 +227,9 @@ class MetadataPanel(ttk.Frame):
         self._tephra_var.set(rec.contains_tephra)
         self._smoke_var.set(rec.contains_smoke)
         self._base_glow_var.set(rec.contains_base_glow)
+        self._provenance_var.set(rec.mask_provenance or "human_rough")
+        for flag, var in self._flag_vars.items():
+            var.set(bool(getattr(rec, flag, False)))
         self._cancel_rename()   # make sure rename row is hidden
 
     # ------------------------------------------------------------------
@@ -249,9 +295,9 @@ class MetadataPanel(ttk.Frame):
             # Save the mask to disk first so pixels are never lost on navigation
             # and so mask_positive_pixels is accurate before writing metadata.
             self.app.save_current_mask()
-            self.app.metadata.update(
-                sid,
+            updates = dict(
                 label_status=self._status_var.get(),
+                mask_provenance=self._provenance_var.get(),
                 difficulty=self._difficulty_var.get(),
                 lighting_condition=self._lighting_var.get(),
                 notes=self._notes_var.get(),
@@ -259,9 +305,44 @@ class MetadataPanel(ttk.Frame):
                 contains_smoke=self._smoke_var.get(),
                 contains_base_glow=self._base_glow_var.get(),
             )
+            for flag, var in self._flag_vars.items():
+                updates[flag] = var.get()
+            self.app.metadata.update(sid, **updates)
             self.app.metadata.save()
             self.app.frame_queue.refresh()
+            self.app.mark_clean()
             self.app.set_status(f"Metadata saved for {sid}")
+
+    # ------------------------------------------------------------------
+    # Flag hotkey support
+    # ------------------------------------------------------------------
+
+    def _on_flag_checkbox(self, flag: str) -> None:
+        """User clicked a flag checkbox: persist immediately + autosave."""
+        if not self._sample_id or not self.app.metadata:
+            return
+        value = self._flag_vars[flag].get()
+        self.app.apply_flag(flag, value)
+
+    def toggle_flag(self, flag: str) -> bool | None:
+        """Toggle *flag* in the UI and return the new value (None if no frame)."""
+        var = self._flag_vars.get(flag)
+        if var is None or not self._sample_id:
+            return None
+        new_val = not var.get()
+        var.set(new_val)
+        return new_val
+
+    def set_flag(self, flag: str, value: bool) -> None:
+        var = self._flag_vars.get(flag)
+        if var is not None:
+            var.set(value)
+
+    def set_provenance(self, provenance: str) -> None:
+        self._provenance_var.set(provenance)
+
+    def set_status_value(self, status: str) -> None:
+        self._status_var.set(status)
 
     def _set_status(self, status: str) -> None:
         if status == "complete":

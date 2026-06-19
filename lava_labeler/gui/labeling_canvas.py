@@ -41,9 +41,14 @@ class LabelingCanvas(ttk.Frame):
         self.undo_stack = UndoStack()
 
         # Full-resolution image state
-        self._frame: np.ndarray | None = None      # BGR uint8
+        self._frame: np.ndarray | None = None      # BGR uint8 (currently displayed)
+        self._label_frame: np.ndarray | None = None  # BGR uint8 anchored label frame
         self._mask: np.ndarray | None = None        # uint8
         self._mode: str = "browse"                  # "browse" | "label"
+
+        # Motion-preview state (playback shows neighbour frames; mask stays anchored)
+        self._previewing: bool = False
+        self._preview_banner: str = ""
 
         # Tool state
         self._tool: str = "brush"
@@ -114,6 +119,9 @@ class LabelingCanvas(ttk.Frame):
     ) -> None:
         self._mode = "label"
         self._frame = frame_bgr
+        self._label_frame = frame_bgr
+        self._previewing = False
+        self._preview_banner = ""
         h, w = frame_bgr.shape[:2]
         if mask is not None and mask.shape == (h, w) and mask.dtype == np.uint8:
             self._mask = mask.copy()
@@ -132,6 +140,56 @@ class LabelingCanvas(ttk.Frame):
 
     def get_current_frame(self) -> np.ndarray | None:
         return self._frame
+
+    def get_label_frame(self) -> np.ndarray | None:
+        """Return the anchored label frame (independent of preview state)."""
+        return self._label_frame if self._label_frame is not None else self._frame
+
+    # Motion-preview ----------------------------------------------------
+
+    def show_preview(self, frame_bgr: np.ndarray, banner: str = "") -> None:
+        """Display a neighbouring frame for motion preview.
+
+        The mask overlay is suppressed and drawing is disabled so the user
+        never confuses the previewed frame with the editable label frame.
+        """
+        if self._mode != "label":
+            return
+        self._previewing = True
+        self._preview_banner = banner
+        self._frame = frame_bgr
+        self._schedule_redraw()
+
+    def end_preview(self) -> None:
+        """Return to the anchored label frame after motion preview."""
+        if not self._previewing:
+            return
+        self._previewing = False
+        self._preview_banner = ""
+        if self._label_frame is not None:
+            self._frame = self._label_frame
+        self._canvas.delete("preview_banner")
+        self._schedule_redraw()
+
+    @property
+    def is_previewing(self) -> bool:
+        return self._previewing
+
+    def clear_mask(self) -> None:
+        """Erase the entire mask, recording an undo patch."""
+        if self._mask is None:
+            return
+        before = self._mask.copy()
+        if int(np.sum(before > 0)) == 0:
+            return
+        self._mask[:] = 0
+        h, w = self._mask.shape
+        self.undo_stack.push(MaskPatch(x0=0, y0=0, before=before, after=self._mask.copy()))
+        self._unsaved = True
+        self._schedule_redraw()
+
+    def has_positive_pixels(self) -> bool:
+        return self._mask is not None and bool(np.any(self._mask > 0))
 
     def mark_saved(self) -> None:
         self._unsaved = False
@@ -176,11 +234,15 @@ class LabelingCanvas(ttk.Frame):
     def undo(self) -> None:
         if self._mask is not None and self.undo_stack.undo(self._mask):
             self._unsaved = True
+            if hasattr(self.app, "mark_dirty"):
+                self.app.mark_dirty()
             self._schedule_redraw()
 
     def redo(self) -> None:
         if self._mask is not None and self.undo_stack.redo(self._mask):
             self._unsaved = True
+            if hasattr(self.app, "mark_dirty"):
+                self.app.mark_dirty()
             self._schedule_redraw()
 
     def zoom_fit(self) -> None:
@@ -226,9 +288,8 @@ class LabelingCanvas(ttk.Frame):
         c.bind("<B2-Motion>", self._on_middle_drag)
         c.bind("<ButtonRelease-2>", self._on_middle_release)
 
-        # Spacebar pan
-        self.bind_all("<KeyPress-space>", self._on_space_press, add=True)
-        self.bind_all("<KeyRelease-space>", self._on_space_release, add=True)
+        # Spacebar is reserved for play/pause (see App). Pan via middle-mouse
+        # button or trackpad scroll instead.
 
         # Brush size keys
         self.bind_all("<bracketleft>", lambda _: self.adjust_brush(-2))
@@ -258,7 +319,7 @@ class LabelingCanvas(ttk.Frame):
             if self._point_in_roi(event.x, event.y):
                 self._start_roi_drag(event.x, event.y)
                 return
-        if self._mode == "label" and self._mask is not None:
+        if self._mode == "label" and self._mask is not None and not self._previewing:
             self._start_stroke(event.x, event.y)
 
     def _on_drag(self, event: tk.Event) -> None:
@@ -428,6 +489,8 @@ class LabelingCanvas(ttk.Frame):
         self._stroke_points = []
         self._current_stroke_tool = None
         self._unsaved = True
+        if hasattr(self.app, "mark_dirty"):
+            self.app.mark_dirty()
         self._schedule_redraw()
 
     # ------------------------------------------------------------------
@@ -509,8 +572,13 @@ class LabelingCanvas(ttk.Frame):
 
         pil_frame = Image.fromarray(crop_rgb).resize((disp_w, disp_h), Image.BILINEAR)
 
-        # Composite mask overlay (label mode only)
-        if self._mode == "label" and self._mask is not None and self._mask_visible:
+        # Composite mask overlay (label mode only, never during motion preview)
+        if (
+            self._mode == "label"
+            and self._mask is not None
+            and self._mask_visible
+            and not self._previewing
+        ):
             crop_mask = self._mask[y0:y1, x0:x1]
             pil_mask = Image.fromarray(crop_mask, mode="L").resize(
                 (disp_w, disp_h), Image.NEAREST
@@ -543,6 +611,21 @@ class LabelingCanvas(ttk.Frame):
 
         self._blit(canvas_img)
         self._draw_roi_overlay()
+        self._draw_preview_banner()
+
+    def _draw_preview_banner(self) -> None:
+        """Show a warning banner while previewing a non-editable frame."""
+        self._canvas.delete("preview_banner")
+        if not self._previewing or not self._preview_banner:
+            return
+        cw = self._canvas.winfo_width()
+        self._canvas.create_rectangle(
+            0, 0, cw, 26, fill="#7a3b00", outline="", tags="preview_banner",
+        )
+        self._canvas.create_text(
+            cw / 2, 13, text=self._preview_banner, fill="#ffd9a0",
+            font=("TkDefaultFont", 11, "bold"), tags="preview_banner",
+        )
 
     def _blit(self, img: Image.Image) -> None:
         photo = ImageTk.PhotoImage(img)

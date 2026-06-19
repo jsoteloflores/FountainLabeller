@@ -11,11 +11,23 @@ if TYPE_CHECKING:
 
 # Colour by label status
 _STATUS_COLORS: dict[str, str] = {
-    "queued":       "#aaaaaa",
-    "in_progress":  "#4fc3f7",
-    "complete":     "#81c784",
-    "uncertain":    "#ffb74d",
-    "needs_review": "#e57373",
+    "queued":          "#aaaaaa",
+    "in_progress":     "#4fc3f7",
+    "complete":        "#81c784",
+    "uncertain":       "#ffb74d",
+    "needs_review":    "#e57373",
+    "skipped":         "#9e9e9e",
+    "bad_frame":       "#b71c1c",
+    "hard_negative":   "#ba68c8",
+    "empty_confirmed": "#90a4ae",
+}
+
+# Maps the right-panel filter selection to the set of statuses it shows.
+_FILTER_STATUSES: dict[str, set[str]] = {
+    "unlabeled": {"queued", "in_progress"},
+    "needs_review": {"needs_review"},
+    "hard_negative": {"hard_negative"},
+    "complete": {"complete"},
 }
 
 
@@ -24,7 +36,12 @@ class FrameQueuePanel(ttk.Frame):
         super().__init__(parent)
         self.app = app
         self._sample_ids: list[str] = []
+        self._filter: str = "all"
         self._build()
+
+    def set_filter(self, filter_name: str) -> None:
+        self._filter = filter_name or "all"
+        self.refresh()
 
     def _build(self) -> None:
         ttk.Label(self, text="Frame Queue", font=("TkDefaultFont", 10, "bold")).pack(
@@ -66,7 +83,10 @@ class FrameQueuePanel(ttk.Frame):
         if self.app.metadata is None:
             return
 
+        allowed = _FILTER_STATUSES.get(self._filter)
         for rec in self.app.metadata.all_records():
+            if allowed is not None and rec.label_status not in allowed:
+                continue
             self._sample_ids.append(rec.sample_id)
             label = f"{rec.sample_id[-30:]:30s}  {rec.label_status}"
             self._listbox.insert(tk.END, label)

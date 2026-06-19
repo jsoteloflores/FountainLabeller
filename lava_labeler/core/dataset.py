@@ -212,7 +212,11 @@ class DatasetFolder:
     def save_image(self, sample_id: str, frame_bgr: np.ndarray) -> Path:
         path = self.image_path(sample_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(path), frame_bgr)
+        from lava_labeler.core.config import atomic_write_bytes
+        ok, buf = cv2.imencode(".png", frame_bgr)
+        if not ok:
+            raise IOError(f"Failed to encode image for {sample_id}")
+        atomic_write_bytes(path, buf.tobytes())
         return path
 
     def save_mask(self, sample_id: str, mask: np.ndarray) -> Path:
@@ -222,7 +226,11 @@ class DatasetFolder:
         mask = np.where(mask > 0, 255, 0).astype(np.uint8)
         path = self.mask_path(sample_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(path), mask)
+        from lava_labeler.core.config import atomic_write_bytes
+        ok, buf = cv2.imencode(".png", mask)
+        if not ok:
+            raise IOError(f"Failed to encode mask for {sample_id}")
+        atomic_write_bytes(path, buf.tobytes())
         return path
 
     def load_mask(self, sample_id: str) -> np.ndarray | None:
