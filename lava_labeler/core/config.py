@@ -74,6 +74,9 @@ DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
     "require_empty_mask_confirmation_once_per_session": True,
     "default_mask_opacity": 0.4,
     "shortcut_config_path": "shortcuts.json",
+    "confirm_clear_nonempty_mask": True,
+    "show_hotkey_toasts": True,
+    "toast_duration_ms": 1500,
 }
 
 
@@ -157,7 +160,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "undo": "Ctrl+Z",
     "redo": "Ctrl+Y",
     "otsu_brush": "O",
-    "clear_mask": "C",
+    "clear_mask": "Ctrl+Backspace",
     "mark_empty": "0",
     # Metadata toggles
     "toggle_wind_affected": "W",
@@ -171,6 +174,7 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "approve_human_clean": "Y",
     "mark_needs_review": "J",
     "toggle_model_draft_corrected": "P",
+    "jump_to_last_saved": "Shift+R",
 }
 
 # Human-readable grouping used by the cheat sheet.
@@ -179,6 +183,7 @@ SHORTCUT_GROUPS: dict[str, list[str]] = {
         "previous_frame", "next_frame", "jump_back_small", "jump_forward_small",
         "jump_back_large", "jump_forward_large", "previous_candidate",
         "next_candidate", "save_and_next", "save", "force_save",
+        "jump_to_last_saved",
     ],
     "Playback": ["play_pause", "toggle_playback_panel"],
     "View": [
@@ -210,6 +215,7 @@ _SPECIAL_KEYS: dict[str, str] = {
     "[": "bracketleft",
     "]": "bracketright",
     "?": "question",
+    "backspace": "BackSpace",
     "/": "slash",
     ".": "period",
     ",": "comma",

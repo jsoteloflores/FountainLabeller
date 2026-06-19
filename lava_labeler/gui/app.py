@@ -52,11 +52,15 @@ class App(tk.Tk):
         self.logger: SessionLogger | None = None
         self.playback = PlaybackController()
         self._active_candidate_id: str | None = None
+        self._last_saved_candidate_id: str | None = None
+        self._last_saved_sample_id: str | None = None
+        self._session_labeled_count: int = 0
         self._review_mode: bool = False
         self._dirty: bool = False
         self._empty_confirm_done: bool = False
         self._playback_after_id: str | None = None
         self._autosave_after_id: str | None = None
+        self._toast_after_id: str | None = None
         self._candidate_filter: str = "all"
 
         # ROI state
@@ -148,6 +152,11 @@ class App(tk.Tk):
         self.metadata_panel = MetadataPanel(right, app=self)
         self.metadata_panel.pack(fill=tk.X, pady=(4, 0))
 
+        # Progress / session stats panel
+        from lava_labeler.gui.progress_panel import ProgressPanel
+        self.progress_panel = ProgressPanel(right, app=self)
+        self.progress_panel.pack(fill=tk.X, pady=(4, 0))
+
         self.labeling_guide = LabelingGuidePanel(right, app=self, start_open=True)
         self.labeling_guide.pack(fill=tk.X, pady=(4, 0))
 
@@ -181,6 +190,13 @@ class App(tk.Tk):
         ttk.Label(status_bar, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(
             fill=tk.X, side=tk.LEFT, expand=True
         )
+        # Toast label — temporarily shown for hotkey feedback
+        self._toast_var = tk.StringVar(value="")
+        self._toast_lbl = tk.Label(
+            status_bar, textvariable=self._toast_var, relief=tk.FLAT,
+            anchor=tk.W, bg="#1e2d3d", fg="#80cbc4", padx=8, pady=0,
+        )
+        # not packed until a toast fires
 
     def _build_timeline(self, parent: ttk.Frame) -> None:
         self.scrubber_var = tk.IntVar(value=0)
@@ -319,6 +335,7 @@ class App(tk.Tk):
             "approve_human_clean": self.approve_human_clean,
             "mark_needs_review": self.mark_needs_review,
             "toggle_model_draft_corrected": lambda: self.toggle_metadata_flag("model_draft_corrected"),
+            "jump_to_last_saved": self.jump_to_last_saved,
         }
 
     # ------------------------------------------------------------------
@@ -804,6 +821,16 @@ class App(tk.Tk):
         self.mark_clean()
         self._log_event("save_mask", details=f"{pos_pixels}px")
         self.set_status(f"Saved {sid}  ({pos_pixels} positive px, {pos_pixels/total*100:.1f}%)")
+        self._show_toast(f"[save] frame saved  ({pos_pixels}px)")
+        # Track last saved for jump_to_last_saved
+        self._last_saved_sample_id = sid
+        if self._active_candidate_id:
+            self._last_saved_candidate_id = self._active_candidate_id
+            if self.recovery is not None:
+                self.recovery.update(last_saved_candidate_id=self._active_candidate_id,
+                                     last_saved_sample_id=sid)
+        if hasattr(self, "progress_panel"):
+            self.progress_panel.refresh()
 
     def warn_if_empty_mask_complete(self) -> bool:
         """Called before marking a frame 'complete'.  Returns True if safe to proceed."""
@@ -926,6 +953,34 @@ class App(tk.Tk):
         self.status_var.set(msg)
 
     # ------------------------------------------------------------------
+    # Toast notifications
+    # ------------------------------------------------------------------
+
+    def _show_toast(self, msg: str) -> None:
+        """Show a temporary hotkey-feedback message in the status bar."""
+        enabled = True
+        if self.project_config is not None:
+            enabled = bool(self.project_config.get("show_hotkey_toasts", True))
+        if not enabled:
+            return
+        duration = 1500
+        if self.project_config is not None:
+            duration = int(self.project_config.get("toast_duration_ms", 1500))
+        self._toast_var.set(msg)
+        self._toast_lbl.pack(side=tk.RIGHT, padx=(2, 2))
+        if self._toast_after_id is not None:
+            try:
+                self.after_cancel(self._toast_after_id)
+            except Exception:
+                pass
+        self._toast_after_id = self.after(duration, self._hide_toast)
+
+    def _hide_toast(self) -> None:
+        self._toast_after_id = None
+        self._toast_lbl.pack_forget()
+        self._toast_var.set("")
+
+    # ------------------------------------------------------------------
     # Dirty state / save indicator
     # ------------------------------------------------------------------
 
@@ -1039,8 +1094,21 @@ class App(tk.Tk):
     def clear_mask(self) -> None:
         if self._active_sample_id is None:
             return
+        # Confirmation for non-empty masks (per project config)
+        if self.canvas.has_positive_pixels():
+            confirm = True
+            if self.project_config is not None:
+                confirm = bool(self.project_config.get("confirm_clear_nonempty_mask", True))
+            if confirm:
+                if not messagebox.askyesno(
+                    "Clear mask?",
+                    "The current mask has positive pixels.\n\n"
+                    "Clear it? This can be undone with Ctrl+Z.",
+                ):
+                    return
         self.canvas.clear_mask()
         self.mark_dirty()
+        self._show_toast("[mask] cleared")
         self.set_status("Mask cleared (undo with Ctrl+Z)")
 
     # ------------------------------------------------------------------
@@ -1065,7 +1133,10 @@ class App(tk.Tk):
         self.frame_queue.refresh()
         self.mark_clean()
         self._log_event("toggle_metadata", details=f"{flag}={'ON' if value else 'OFF'}")
+        self._show_toast(f"[metadata] {flag}: {'ON' if value else 'OFF'}")
         self.set_status(f"{flag}: {'ON' if value else 'OFF'}")
+        if hasattr(self, "progress_panel"):
+            self.progress_panel.refresh()
 
     def mark_hard_negative(self) -> None:
         if self._active_sample_id is None or self.metadata is None:
@@ -1081,6 +1152,9 @@ class App(tk.Tk):
             self._update_candidate_status_from_record()
             self.frame_queue.refresh()
         self._log_event("mark_hard_negative")
+        self._show_toast(f"[metadata] hard_negative: {'ON' if new_val else 'OFF'}")
+        if hasattr(self, "progress_panel"):
+            self.progress_panel.refresh()
 
     def approve_human_clean(self) -> None:
         if self._active_sample_id is None or self.metadata is None:
@@ -1099,6 +1173,9 @@ class App(tk.Tk):
         self.mark_clean()
         self._log_event("approve_mask")
         self.set_status("Approved: human_clean")
+        self._show_toast("[metadata] human_clean: approved")
+        if hasattr(self, "progress_panel"):
+            self.progress_panel.refresh()
 
     def mark_needs_review(self) -> None:
         if self._active_sample_id is None or self.metadata is None:
@@ -1114,6 +1191,9 @@ class App(tk.Tk):
         self.mark_clean()
         self._log_event("needs_review")
         self.set_status("Marked needs_review")
+        self._show_toast("[metadata] needs_review: ON")
+        if hasattr(self, "progress_panel"):
+            self.progress_panel.refresh()
 
     def mark_empty(self) -> None:
         """Mark the current frame as an intentionally-empty (true-negative) label."""
@@ -1160,6 +1240,9 @@ class App(tk.Tk):
         self.mark_clean()
         self._log_event("mark_empty")
         self.set_status(f"Marked intentionally empty ({new_status})")
+        self._show_toast(f"[mask] empty mask confirmed ({new_status})")
+        if hasattr(self, "progress_panel"):
+            self.progress_panel.refresh()
 
     def force_save(self) -> None:
         self.save_current_mask()
@@ -1305,6 +1388,9 @@ class App(tk.Tk):
             self._update_candidate_status_from_record()
             self._save_candidates()
             self.mark_clean()
+            self._session_labeled_count += 1
+            if hasattr(self, "progress_panel"):
+                self.progress_panel.refresh()
         if self.candidates is None:
             self.set_status("Saved. (No candidate queue loaded.)")
             return
@@ -1364,6 +1450,43 @@ class App(tk.Tk):
     def _on_filter_change(self, _event=None) -> None:
         self._candidate_filter = self._filter_var.get()
         self.frame_queue.set_filter(self._candidate_filter)
+
+    # ------------------------------------------------------------------
+    # Jump to last saved
+    # ------------------------------------------------------------------
+
+    def jump_to_last_saved(self) -> None:
+        """Jump back to the last saved candidate / sample."""
+        # Check recovery for last_saved_candidate_id in case app just loaded.
+        last_cid = self._last_saved_candidate_id
+        last_sid = self._last_saved_sample_id
+        if last_cid is None and self.recovery is not None:
+            last_cid = self.recovery.get("last_saved_candidate_id", "") or None
+        if last_sid is None and self.recovery is not None:
+            last_sid = self.recovery.get("last_saved_sample_id", "") or None
+
+        if last_cid is None and last_sid is None:
+            self._show_toast("No last saved candidate yet.")
+            self.set_status("No last saved candidate yet.")
+            return
+
+        if not self._check_unsaved(context="before jumping to last saved"):
+            return
+
+        if last_cid and self.candidates is not None:
+            cand = self.candidates.get(last_cid)
+            if cand is not None:
+                self.open_candidate(cand)
+                self._show_toast(f"[nav] returned to {last_cid}")
+                return
+
+        if last_sid and self.metadata is not None and self.metadata.get(last_sid) is not None:
+            self.open_frame_for_labeling(last_sid)
+            self._show_toast(f"[nav] returned to {last_sid}")
+            return
+
+        self._show_toast("Last saved frame no longer available.")
+        self.set_status("Last saved frame no longer available.")
 
     # ------------------------------------------------------------------
     # Playback
@@ -1506,13 +1629,19 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
             return
+        warnings = summary.get("validation_warnings", 0)
+        warn_text = f"\n\nValidation warnings: {warnings}" if warnings else ""
+        report_text = f"\nValidation report:\n{summary.get('validation_report', '')}" if warnings else ""
         messagebox.showinfo(
             "Export complete",
             f"Exported {summary['exported']} samples.\n"
-            f"Skipped (not finalized): {summary['skipped']}\n\n"
-            f"Manifest:\n{summary['manifest']}",
+            f"Skipped (not finalized): {summary['skipped']}{warn_text}\n\n"
+            f"Manifest:\n{summary['manifest']}{report_text}",
         )
-        self.set_status(f"Exported {summary['exported']} samples → labels_manifest.csv")
+        status = f"Exported {summary['exported']} samples → labels_manifest.csv"
+        if warnings:
+            status += f"  ({warnings} validation warnings)"
+        self.set_status(status)
 
     # ------------------------------------------------------------------
     # Unsaved-changes guard

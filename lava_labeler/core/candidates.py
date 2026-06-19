@@ -96,6 +96,12 @@ class CandidateQueue:
 
     def _load_csv(self, path: Path) -> None:
         df = pd.read_csv(path, dtype=str).fillna("")
+        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"Candidate CSV {path.name!r} is missing required columns: {missing}. "
+                f"Required: {REQUIRED_COLUMNS}"
+            )
         for _, row in df.iterrows():
             self._add_from_dict(row.to_dict())
 

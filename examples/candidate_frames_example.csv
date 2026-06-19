@@ -1,0 +1,7 @@
+candidate_id,video_id,video_path,frame_index,time_seconds,camera_id,reason,priority,status,notes
+vid001_000120,vid001,/path/to/video.mp4,120,4.00,camA,manual_seed,1,unlabeled,normal rising fountain — clear jet visible
+vid001_000350,vid001,/path/to/video.mp4,350,11.67,camA,hard_negative_seed,2,unlabeled,wind-drifted tephra only — good hard-negative example
+vid001_000900,vid001,/path/to/video.mp4,900,30.00,camA,ambiguous_boundary,3,needs_review,top plume spreading — ambiguous upper boundary
+vid002_001200,vid002,/path/to/video2.mp4,1200,40.00,camB,manual_seed,1,unlabeled,strong fountain pulse
+vid002_001500,vid002,/path/to/video2.mp4,1500,50.00,camB,hard_negative_seed,2,unlabeled,cooling tephra cloud — no active rising material
+vid002_002100,vid002,/path/to/video2.mp4,2100,70.00,camB,ambiguous_boundary,3,unlabeled,smoke obscured — partial visibility
