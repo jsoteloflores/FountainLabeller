@@ -45,7 +45,7 @@ _FRAMES_CSV = "metadata/frames.csv"
 
 COLUMNS = [
     "sample_id", "image_path", "mask_path",
-    "video_path", "video_id", "episode_id", "camera_id",
+    "video_path", "video_id", "video_filename", "episode_id", "camera_id",
     "candidate_id", "target_definition",
     "frame_index", "time_seconds",
     "source_width", "source_height", "export_width", "export_height",
@@ -69,6 +69,7 @@ class FrameRecord:
     source_height: int
     fps: float = 25.0
     video_id: str = ""
+    video_filename: str = ""          # populated from registry; fallback = basename(video_path)
     episode_id: str = "unknownEpisode"
     camera_id: str = "unknownCamera"
     label_status: str = "queued"
@@ -132,6 +133,7 @@ class FrameRecord:
             "mask_path": msk_path,
             "video_path": self.video_path,
             "video_id": self.video_id,
+            "video_filename": self.video_filename or Path(self.video_path).name,
             "episode_id": self.episode_id,
             "camera_id": self.camera_id,
             "candidate_id": self.candidate_id,
@@ -229,6 +231,7 @@ class MetadataStore:
             source_width=_i("source_width"),
             source_height=_i("source_height"),
             video_id=_s("video_id"),
+            video_filename=_s("video_filename"),
             episode_id=_s("episode_id", "unknownEpisode"),
             camera_id=_s("camera_id", "unknownCamera"),
             label_status=_s("label_status", "queued"),

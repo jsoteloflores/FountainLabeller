@@ -77,6 +77,22 @@ DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
     "confirm_clear_nonempty_mask": True,
     "show_hotkey_toasts": True,
     "toast_duration_ms": 1500,
+    # Metadata registry & accounting (Stage 1c)
+    "metadata": {
+        "use_video_registry": True,
+        "regenerate_csv_on_save": True,
+        "regenerate_csv_on_close": True,
+        "regenerate_training_manifest_on_close": False,
+        "csv_mirror_debounce_ms": 1500,
+        "require_episode_id_for_export": False,
+        "require_camera_id_for_export": False,
+        "target_definition": "active_rising_lava_fountain",
+    },
+    "gui": {
+        "show_dataset_context_panel": True,
+        "dataset_context_panel_compact": True,
+        "metadata_details_button_label": "Dataset Details…",
+    },
 }
 
 

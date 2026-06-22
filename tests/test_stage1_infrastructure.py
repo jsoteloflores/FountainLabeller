@@ -312,6 +312,7 @@ class TestExportValidation:
         defaults = dict(
             sample_id="s1", video_path="/v.mp4", frame_index=1,
             source_width=0, source_height=0,
+            video_id="vid_000001",
             mask_positive_pixels=0, empty_mask_confirmed=False,
             hard_negative=False, label_status="complete", mask_provenance="human_clean",
         )

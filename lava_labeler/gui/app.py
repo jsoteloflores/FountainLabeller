@@ -11,7 +11,9 @@ import numpy as np
 
 from lava_labeler.core.candidates import Candidate, CandidateQueue
 from lava_labeler.core.config import ProjectConfig, ShortcutConfig
+from lava_labeler.core.csv_mirror import regenerate_all as _regen_csv_all
 from lava_labeler.core.dataset import DatasetFolder, make_sample_id
+from lava_labeler.core.dataset_summary import DatasetSummary
 from lava_labeler.core.frame_cache import FrameCache
 from lava_labeler.core.logging_utils import SessionLogger
 from lava_labeler.core.metadata import FrameRecord, MetadataStore
@@ -19,6 +21,8 @@ from lava_labeler.core.playback import PlaybackController
 from lava_labeler.core.qc import generate_overlay, generate_thumbnail
 from lava_labeler.core.session import SessionRecovery
 from lava_labeler.core.video_io import VideoReader
+from lava_labeler.core.video_registry import VideoRegistry, MatchTier
+from lava_labeler.gui.dataset_context_panel import DatasetContextPanel
 from lava_labeler.gui.export_dialog import ExportDialog
 from lava_labeler.gui.frame_queue import FrameQueuePanel
 from lava_labeler.gui.labeling_canvas import LabelingCanvas
@@ -62,6 +66,12 @@ class App(tk.Tk):
         self._autosave_after_id: str | None = None
         self._toast_after_id: str | None = None
         self._candidate_filter: str = "all"
+        # Stage-1c metadata registry & accounting
+        self.video_registry: VideoRegistry | None = None
+        self.dataset_summary: DatasetSummary | None = None
+        self._active_video_id: str | None = None
+        self._video_registry_tier: MatchTier = "new"
+        self._csv_mirror_after_id: str | None = None
 
         # ROI state
         self._roi_mode: str = "full_frame"           # "full_frame" | "fixed_roi_crop"
@@ -112,6 +122,7 @@ class App(tk.Tk):
         )
         view_menu.add_separator()
         view_menu.add_command(label="Keyboard Shortcuts…", command=self.show_cheat_sheet)
+        view_menu.add_command(label="Dataset Details…", command=self.show_dataset_details)
         menubar.add_cascade(label="View", menu=view_menu)
 
     def _build_layout(self) -> None:
@@ -151,6 +162,10 @@ class App(tk.Tk):
 
         self.metadata_panel = MetadataPanel(right, app=self)
         self.metadata_panel.pack(fill=tk.X, pady=(4, 0))
+
+        # Dataset Context panel (compact video/episode/dataset stats)
+        self.dataset_context_panel = DatasetContextPanel(right, app=self)
+        self.dataset_context_panel.pack(fill=tk.X, pady=(4, 0))
 
         # Progress / session stats panel
         from lava_labeler.gui.progress_panel import ProgressPanel
@@ -367,8 +382,35 @@ class App(tk.Tk):
             self._video_info_var.set(info.summary)
             self.title(f"Lava Labeler — {Path(path).name}")
             self._load_frame(0, fit=True)
+            self._register_video(info)
         except Exception as exc:
             messagebox.showerror("Cannot open video", str(exc))
+
+    def _register_video(self, info) -> None:
+        """Register the current VideoInfo in the VideoRegistry (if enabled)."""
+        if self.video_registry is None:
+            return
+        ep = self.metadata_panel.episode_var.get() if hasattr(self, "metadata_panel") else ""
+        cam = self.metadata_panel.camera_var.get() if hasattr(self, "metadata_panel") else ""
+        entry, tier = self.video_registry.register(info, episode_id=ep, camera_id=cam)
+        self._active_video_id = entry.video_id
+        self._video_registry_tier = tier
+        self.video_registry.save_csv()
+        if tier == "filename_mismatch":
+            messagebox.showwarning(
+                "Video registry",
+                f"A video named '{info.path.name}' was seen before, but the file properties "
+                f"differ (frame count, fps, or resolution changed).\n\n"
+                f"A new registry entry has been created: {entry.video_id}.",
+            )
+        elif tier == "new":
+            self.set_status(f"Registered new video: {entry.video_id} ({info.path.name})")
+        else:
+            self.set_status(f"Recognized video: {entry.video_id} ({tier})")
+        if self.dataset_summary is not None:
+            self.dataset_summary.refresh()
+        if hasattr(self, "dataset_context_panel"):
+            self.dataset_context_panel.refresh()
 
     def _get_frame(self, index: int) -> np.ndarray | None:
         if self.video_reader is None:
@@ -455,10 +497,10 @@ class App(tk.Tk):
         self._maybe_resume_session()
 
     def _init_session(self, root) -> None:
-        """Load project config, shortcuts, recovery, logger for a dataset."""
+        """Load project config, shortcuts, recovery, logger, registry for a dataset."""
         self.project_config = ProjectConfig.load(root)
         shortcut_file = str(self.project_config.get("shortcut_config_path", "shortcuts.json"))
-        self.shortcuts = ShortcutConfig.load(root, Path(shortcut_file).name)
+        self.shortcuts = ShortcutConfig.load(root, shortcut_file)
         self._bind_shortcuts()  # rebind in case the user customised shortcuts.json
         self.recovery = SessionRecovery(root)
         self.logger = SessionLogger(root)
@@ -473,6 +515,16 @@ class App(tk.Tk):
         self.canvas.set_mask_alpha(opacity)
         if hasattr(self, "toolbar") and hasattr(self.toolbar, "_opacity_var"):
             self.toolbar._opacity_var.set(opacity)
+        # Video registry
+        use_reg = True
+        meta_cfg = self.project_config.get("metadata", {})
+        if isinstance(meta_cfg, dict):
+            use_reg = meta_cfg.get("use_video_registry", True)
+        if use_reg:
+            self.video_registry = VideoRegistry(root)
+        # Dataset summary (needs metadata store to be set first)
+        if self.metadata is not None:
+            self.dataset_summary = DatasetSummary(self.metadata, self.video_registry)
         # Auto-load a candidate queue if one lives in the dataset folder.
         for name in ("candidate_frames.csv", "candidate_frames.json"):
             cand_path = Path(root) / name
@@ -831,6 +883,12 @@ class App(tk.Tk):
                                      last_saved_sample_id=sid)
         if hasattr(self, "progress_panel"):
             self.progress_panel.refresh()
+        # Refresh dataset accounting panels and schedule CSV mirror
+        if self.dataset_summary is not None:
+            self.dataset_summary.refresh()
+        if hasattr(self, "dataset_context_panel"):
+            self.dataset_context_panel.refresh()
+        self._schedule_csv_mirror()
 
     def warn_if_empty_mask_complete(self) -> bool:
         """Called before marking a frame 'complete'.  Returns True if safe to proceed."""
@@ -1039,6 +1097,51 @@ class App(tk.Tk):
             self.metadata.save()
 
     # ------------------------------------------------------------------
+    # CSV mirror
+    # ------------------------------------------------------------------
+
+    def _schedule_csv_mirror(self) -> None:
+        """Debounce CSV regeneration so rapid saves don't thrash disk."""
+        if self._csv_mirror_after_id is not None:
+            try:
+                self.after_cancel(self._csv_mirror_after_id)
+            except Exception:
+                pass
+        debounce = 1500
+        if self.project_config:
+            meta = self.project_config.get("metadata", {})
+            if isinstance(meta, dict):
+                debounce = int(meta.get("csv_mirror_debounce_ms", 1500))
+        self._csv_mirror_after_id = self.after(debounce, self._csv_mirror_tick)
+
+    def _csv_mirror_tick(self) -> None:
+        self._csv_mirror_after_id = None
+        self._regenerate_csv_mirrors()
+
+    def _regenerate_csv_mirrors(self, force: bool = False) -> None:
+        """Regenerate video_registry.csv, frame_metadata.csv, dataset_summary.csv."""
+        if self.metadata is None or self.dataset is None:
+            return
+        enabled = True
+        if not force and self.project_config:
+            meta = self.project_config.get("metadata", {})
+            if isinstance(meta, dict):
+                enabled = meta.get("regenerate_csv_on_save", True)
+        if not enabled:
+            return
+        if self.dataset_summary is not None:
+            self.dataset_summary.refresh()
+        try:
+            _regen_csv_all(
+                self.dataset.root,
+                self.metadata,
+                registry=self.video_registry,
+                summary=self.dataset_summary,
+            )
+        except Exception:
+            pass  # CSV mirrors are non-critical; don't interrupt the workflow
+
+    # ------------------------------------------------------------------
     # Logging helper
     # ------------------------------------------------------------------
 
@@ -1086,6 +1189,10 @@ class App(tk.Tk):
 
     def show_cheat_sheet(self) -> None:
         CheatSheetDialog(self, self.shortcuts)
+
+    def show_dataset_details(self) -> None:
+        from lava_labeler.gui.metadata_details_window import MetadataDetailsWindow
+        MetadataDetailsWindow(self)
 
     def toggle_review_mode(self) -> None:
         self._review_mode = self._review_mode_var.get()
@@ -1341,7 +1448,8 @@ class App(tk.Tk):
             source_width=info.width,
             source_height=info.height,
             fps=info.fps,
-            video_id=candidate.video_id,
+            video_id=candidate.video_id or self._active_video_id or "",
+            video_filename=info.path.name,
             episode_id=ep,
             camera_id=cam,
             candidate_id=candidate.candidate_id,
@@ -1685,6 +1793,38 @@ class App(tk.Tk):
         if not self._check_unsaved(context="before quitting"):
             return
         self._stop_playback()
+        # Cancel pending timers
+        for attr in ("_autosave_after_id", "_csv_mirror_after_id", "_toast_after_id"):
+            aid = getattr(self, attr, None)
+            if aid is not None:
+                try:
+                    self.after_cancel(aid)
+                except Exception:
+                    pass
+        # Save canonical JSON state
+        if self.video_registry is not None:
+            try:
+                self.video_registry.save()
+            except Exception:
+                pass
+        if self.metadata is not None:
+            try:
+                self.metadata.save()
+            except Exception:
+                pass
+        if self.candidates is not None:
+            try:
+                self.candidates.save()
+            except Exception:
+                pass
+        # Regenerate CSV mirrors on close
+        regen_on_close = True
+        if self.project_config:
+            meta = self.project_config.get("metadata", {})
+            if isinstance(meta, dict):
+                regen_on_close = meta.get("regenerate_csv_on_close", True)
+        if regen_on_close:
+            self._regenerate_csv_mirrors(force=True)
         if self.recovery is not None:
             # Clean exit: drop the recovery file so we don't prompt next time.
             self.recovery.clear()

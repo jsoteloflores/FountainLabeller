@@ -36,10 +36,22 @@ SCHEMA_VERSION = "1.0"
 EXPORTABLE_STATUSES = {"complete", "hard_negative", "empty_confirmed"}
 
 MANIFEST_COLUMNS = [
-    "sample_id", "video_id", "video_path", "frame_index", "time_seconds",
-    "camera_id", "image_path", "mask_path", "mask_status", "mask_provenance",
+    # Stage 2 required columns
+    "image_path", "mask_path",
+    "video_id", "video_filename", "episode_id", "camera_id",
+    "frame_index", "time_seconds",
     "target_definition",
-] + METADATA_FLAGS + ["label_notes", "created_at", "updated_at"]
+    "label_status", "mask_status", "mask_provenance",
+    "hard_negative", "empty_mask_confirmed",
+    "wind_affected", "falling_tephra_visible", "cooling_tephra_visible",
+    "smoke_obscured", "ground_glow_visible", "exposure_bloom",
+    "ambiguous_boundary", "needs_review",
+    # Additional recommended columns
+    "sample_id", "candidate_id",
+    "mask_pixel_count", "has_positive_mask", "mask_area_fraction",
+    "exportable", "validation_errors", "validation_warnings",
+    "label_notes", "created_at", "updated_at",
+]
 
 VALIDATION_COLUMNS = [
     "frame_id", "video_id", "frame_index", "label_status",
@@ -106,6 +118,21 @@ def validate_records(
             warnings.append(
                 f"label_status={rec.label_status} but mask_provenance is not set."
             )
+            if vstatus == "ok":
+                vstatus = "warning"
+
+        # Rule 5: wrong target_definition
+        if rec.target_definition and rec.target_definition != TARGET_DEFINITION:
+            warnings.append(
+                f"target_definition='{rec.target_definition}' does not match "
+                f"expected '{TARGET_DEFINITION}'."
+            )
+            if vstatus == "ok":
+                vstatus = "warning"
+
+        # Rule 6: missing video_id on exportable rows
+        if rec.label_status in EXPORTABLE_STATUSES and not rec.video_id:
+            warnings.append("video_id is missing on an exportable row.")
             if vstatus == "ok":
                 vstatus = "warning"
 
@@ -213,24 +240,43 @@ def export_dataset(
     writer = csv.DictWriter(buf, fieldnames=MANIFEST_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for rec in exportable:
+        pos_px = rec.mask_positive_pixels or 0
+        total_px = (rec.source_width or 1) * (rec.source_height or 1)
         row = {
-            "sample_id": rec.sample_id,
-            "video_id": rec.video_id,
-            "video_path": rec.video_path,
-            "frame_index": rec.frame_index,
-            "time_seconds": round(rec.time_seconds, 4),
-            "camera_id": rec.camera_id,
             "image_path": f"images/all/{rec.sample_id}.png",
             "mask_path": f"masks/all/{rec.sample_id}_mask.png",
+            "video_id": rec.video_id,
+            "video_filename": rec.video_filename or Path(rec.video_path).name,
+            "episode_id": rec.episode_id,
+            "camera_id": rec.camera_id,
+            "frame_index": rec.frame_index,
+            "time_seconds": round(rec.time_seconds, 4),
+            "target_definition": rec.target_definition or TARGET_DEFINITION,
+            "label_status": rec.label_status,
             "mask_status": rec.label_status,
             "mask_provenance": rec.mask_provenance,
-            "target_definition": rec.target_definition or TARGET_DEFINITION,
+            "hard_negative": rec.hard_negative,
+            "empty_mask_confirmed": rec.empty_mask_confirmed,
+            "wind_affected": rec.wind_affected,
+            "falling_tephra_visible": rec.falling_tephra_visible,
+            "cooling_tephra_visible": rec.cooling_tephra_visible,
+            "smoke_obscured": rec.smoke_obscured,
+            "ground_glow_visible": rec.ground_glow_visible,
+            "exposure_bloom": rec.exposure_bloom,
+            "ambiguous_boundary": rec.ambiguous_boundary,
+            "needs_review": rec.needs_review,
+            "sample_id": rec.sample_id,
+            "candidate_id": rec.candidate_id,
+            "mask_pixel_count": pos_px,
+            "has_positive_mask": pos_px > 0,
+            "mask_area_fraction": round(pos_px / total_px, 6) if total_px else 0.0,
+            "exportable": True,
+            "validation_errors": "",
+            "validation_warnings": "",
             "label_notes": rec.notes,
             "created_at": rec.created_at,
             "updated_at": rec.updated_at,
         }
-        for flag in METADATA_FLAGS:
-            row[flag] = bool(getattr(rec, flag))
         writer.writerow(row)
 
     manifest_path = dataset.root / "labels_manifest.csv"
