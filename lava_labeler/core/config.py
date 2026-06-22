@@ -87,6 +87,7 @@ DEFAULT_PROJECT_CONFIG: dict[str, Any] = {
         "require_episode_id_for_export": False,
         "require_camera_id_for_export": False,
         "target_definition": "active_rising_lava_fountain",
+        "strict_target_definition_validation": True,
     },
     "gui": {
         "show_dataset_context_panel": True,

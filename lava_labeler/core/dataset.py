@@ -15,7 +15,8 @@ DATASET_CONFIG_NAME = "dataset_config.json"
 _DEFAULT_CONFIG: dict = {
     "dataset_name": "lava_fountain_dataset",
     "dataset_version": "0.1.0",
-    "class_positive": "visible_airborne_incandescent_lava_fountain",
+    "class_positive": "active_rising_lava_fountain",
+    "target_definition": "active_rising_lava_fountain",
     "mask_format": {
         "dtype": "uint8",
         "background": 0,
@@ -37,18 +38,37 @@ _DEFAULT_CONFIG: dict = {
 }
 
 _CLASS_DEFINITION = """\
-# Lava Fountain Segmentation — Class Definition
+# Class Definition
 
-## Positive Class
+## Positive class: active_rising_lava_fountain
 
-Visible airborne incandescent lava fountain material **inside the selected
-target-fountain analysis ROI**.
+Label pixels that are part of coherent incandescent lava material still
+dynamically connected to the upward fountain, jet, or rising plume structure
+emerging from the vent/source region.
 
-## Negative Class
+Include:
 
-Everything else inside the ROI, including sky, smoke, crater walls, base glow,
-ground lava, non-incandescent tephra, artifacts, and non-target material inside
-the ROI.
+- coherent rising fountain core/body
+- incandescent material actively moving upward as part of the fountain
+- connected or visually continuous rising fountain envelope
+- turbulent active fountain body before it detaches, cools, falls, or drifts away
+
+## Negative class: background
+
+Do not label:
+
+- wind-drifted tephra
+- falling incandescent particles
+- detached fragments no longer part of the rising fountain
+- cooling/diffuse plume material
+- smoke, steam, ash, or obscuration
+- ground glow or old incandescent deposits
+- vent/crater walls/sky/background terrain
+- camera artifacts, exposure bloom, or lens glare
+- any incandescent material that is not part of the active rising fountain structure
+
+When boundary behavior is unclear, label conservatively and set
+`ambiguous_boundary = true` in frame metadata.
 
 ## Outside ROI
 
@@ -61,28 +81,50 @@ the model.
 Nearby vents outside the target ROI are excluded from training and measurement
 so that non-target incandescent activity does not bias target-fountain
 segmentation.
-
-## Edge Cases
-
-- Bright base glow is **negative** unless clearly airborne.
-- Detached incandescent clasts may be **positive** only if visibly part of the airborne fountain.
-- Wind-blown tephra/ash: label only if the material is visibly incandescent and airborne lava.
-- Partially visible lava behind smoke/tephra: label only what is visually inferable.
-- Fully hidden lava: do **not** label.
 """
 
 _README = """\
 # Lava Fountain Segmentation Dataset
 
-Binary segmentation dataset for lava fountain material in volcanic eruption video.
+Binary segmentation dataset for active rising lava fountain material in
+volcanic eruption video.
 
-## Positive Class
+## Positive class: active_rising_lava_fountain
 
-Visible airborne incandescent blackbody lava fountain material.
+```
+1 = active rising lava fountain material
+0 = background / non-rising / detached / falling / drifting / cooling material
+```
 
-## Negative Class
+Label pixels that are part of coherent incandescent lava material still
+dynamically connected to the upward fountain, jet, or rising plume structure
+emerging from the vent/source region.
 
-Everything else — see `metadata/class_definition.md` for full definition and edge cases.
+## Negative class: background
+
+Explicitly excluded from the positive class:
+
+- wind-drifted tephra
+- falling incandescent particles or detached fragments
+- cooling/diffuse plume material
+- smoke, steam, ash, or obscuration
+- ground glow or old incandescent deposits
+- exposure bloom, lens glare, or camera artifacts
+- vent/crater walls, sky, or background terrain
+
+See `metadata/class_definition.md` for full edge-case guidance.
+
+## Metadata flags
+
+The following per-frame flags are part of the dataset accounting system and
+are expected by Stage 2 training:
+
+- `hard_negative` — frame with no fountain visible (explicit negative example)
+- `wind_affected` — wind significantly deflects or disperses the fountain
+- `falling_tephra_visible` — falling incandescent particles visible in frame
+- `cooling_tephra_visible` — cooling/diffuse tephra visible in frame
+- `smoke_obscured` — fountain partially or fully obscured by smoke/steam/ash
+- `ambiguous_boundary` — boundary between rising fountain and background is unclear
 
 ## File Pairing
 

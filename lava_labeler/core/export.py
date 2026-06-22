@@ -35,6 +35,15 @@ SCHEMA_VERSION = "1.0"
 # Statuses considered "exportable" training samples.
 EXPORTABLE_STATUSES = {"complete", "hard_negative", "empty_confirmed"}
 
+# Known stale target-definition strings from earlier labeling rounds.
+# Any row with one of these values gets a specific "stale" warning.
+STALE_TARGET_DEFINITIONS: frozenset[str] = frozenset({
+    "visible_airborne_incandescent_lava_fountain",
+    "visible_incandescent_lava",
+    "incandescent_lava",
+    "lava",
+})
+
 MANIFEST_COLUMNS = [
     # Stage 2 required columns
     "image_path", "mask_path",
@@ -67,6 +76,7 @@ VALIDATION_COLUMNS = [
 def validate_records(
     records: "list[FrameRecord]",
     exportable_ids: set[str] | None = None,
+    strict_target: bool = False,
 ) -> list[dict]:
     """Check every record for consistency.  Returns a list of result dicts.
 
@@ -121,14 +131,23 @@ def validate_records(
             if vstatus == "ok":
                 vstatus = "warning"
 
-        # Rule 5: wrong target_definition
-        if rec.target_definition and rec.target_definition != TARGET_DEFINITION:
+        # Rule 5: stale or wrong target_definition
+        td = (rec.target_definition or "").strip()
+        if td in STALE_TARGET_DEFINITIONS:
             warnings.append(
-                f"target_definition='{rec.target_definition}' does not match "
-                f"expected '{TARGET_DEFINITION}'."
+                f"Row uses stale target_definition='{td}'. Current expected target is "
+                f"'{TARGET_DEFINITION}'. Verify or relabel before Stage 2 training."
             )
-            if vstatus == "ok":
-                vstatus = "warning"
+            vstatus = "error" if strict_target else "warning"
+            if strict_target:
+                included = False
+        elif td and td != TARGET_DEFINITION:
+            warnings.append(
+                f"target_definition='{td}' does not match expected '{TARGET_DEFINITION}'."
+            )
+            vstatus = "error" if strict_target else "warning"
+            if strict_target:
+                included = False
 
         # Rule 6: missing video_id on exportable rows
         if rec.label_status in EXPORTABLE_STATUSES and not rec.video_id:
@@ -206,6 +225,7 @@ def export_dataset(
     dataset: "DatasetFolder",
     metadata: "MetadataStore",
     statuses: set[str] | None = None,
+    strict_target: bool = False,
 ) -> dict:
     """Write per-frame JSON files, labels_manifest.csv, and validation report.
 
@@ -219,7 +239,8 @@ def export_dataset(
     # --- Validation pass (all records) ---
     # Build the set of IDs that would be exported under normal rules.
     candidate_ids = {r.sample_id for r in records if r.label_status in statuses}
-    val_results = validate_records(records, exportable_ids=candidate_ids)
+    val_results = validate_records(records, exportable_ids=candidate_ids,
+                                   strict_target=strict_target)
 
     # Remove records that validation marked as excluded (Rule 1, 2).
     excluded_by_validation = {
