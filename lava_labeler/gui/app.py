@@ -140,10 +140,35 @@ class App(tk.Tk):
         main = ttk.Frame(self)
         main.pack(fill=tk.BOTH, expand=True)
 
-        # Right panel
-        right = ttk.Frame(main, width=290)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=4)
-        right.pack_propagate(False)
+        # Right panel — scrollable
+        right_outer = ttk.Frame(main, width=290)
+        right_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=4)
+        right_outer.pack_propagate(False)
+
+        _right_canvas = tk.Canvas(right_outer, highlightthickness=0)
+        _right_sb = ttk.Scrollbar(right_outer, orient=tk.VERTICAL,
+                                   command=_right_canvas.yview)
+        _right_canvas.configure(yscrollcommand=_right_sb.set)
+        _right_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        _right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right = ttk.Frame(_right_canvas)
+        _right_win = _right_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        def _on_right_inner_resize(event):
+            _right_canvas.configure(scrollregion=_right_canvas.bbox("all"))
+        right.bind("<Configure>", _on_right_inner_resize)
+
+        def _on_right_canvas_resize(event):
+            _right_canvas.itemconfig(_right_win, width=event.width)
+        _right_canvas.bind("<Configure>", _on_right_canvas_resize)
+
+        def _scroll_right_panel(event):
+            _right_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        _right_canvas.bind("<Enter>",
+                           lambda e: _right_canvas.bind_all("<MouseWheel>", _scroll_right_panel))
+        _right_canvas.bind("<Leave>",
+                           lambda e: _right_canvas.unbind_all("<MouseWheel>"))
 
         # Candidate filter
         filter_row = ttk.Frame(right)
