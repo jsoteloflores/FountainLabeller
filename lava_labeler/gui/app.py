@@ -125,6 +125,15 @@ class App(tk.Tk):
         view_menu.add_command(label="Dataset Details…", command=self.show_dataset_details)
         menubar.add_cascade(label="View", menu=view_menu)
 
+        tools_menu = tk.Menu(menubar, tearoff=False)
+        tools_menu.add_command(label="Relink Source Videos…", command=self.relink_source_videos)
+        tools_menu.add_separator()
+        tools_menu.add_command(
+            label="Export 2.5D Temporal Dataset…",
+            command=self.open_temporal_export_dialog,
+        )
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
     def _build_layout(self) -> None:
         # Top toolbar
         self.toolbar = Toolbar(self, app=self)
@@ -437,6 +446,34 @@ class App(tk.Tk):
         if hasattr(self, "dataset_context_panel"):
             self.dataset_context_panel.refresh()
 
+    def _ensure_active_video_registered(self):
+        """Ensure the current video has a registry entry and return it.
+
+        Unlike :meth:`_register_video`, this is safe to call even when the
+        registry did not exist when the video was first opened (e.g. the user
+        opened a video *before* opening a dataset). Returns the active
+        ``VideoEntry`` or ``None`` if no video/dataset/registry is available.
+        """
+        if self.video_reader is None:
+            return None
+
+        if self.video_registry is None and self.dataset is not None:
+            self.video_registry = VideoRegistry(self.dataset.root)
+
+        if self.video_registry is None:
+            return None
+
+        info = self.video_reader.info
+        ep = self.metadata_panel.episode_var.get() if hasattr(self, "metadata_panel") else ""
+        cam = self.metadata_panel.camera_var.get() if hasattr(self, "metadata_panel") else ""
+
+        entry, tier = self.video_registry.register(info, episode_id=ep, camera_id=cam)
+        self._active_video_id = entry.video_id
+        self._video_registry_tier = tier
+        self.video_registry.save()
+        self.video_registry.save_csv()
+        return entry
+
     def _get_frame(self, index: int) -> np.ndarray | None:
         if self.video_reader is None:
             return None
@@ -678,9 +715,13 @@ class App(tk.Tk):
             roi_mode_val = "full_frame"
             roi_policy = "none"
 
+        entry = self._ensure_active_video_registered()
+
         rec = FrameRecord(
             sample_id=sid,
             video_path=str(info.path),
+            video_id=entry.video_id if entry is not None else (self._active_video_id or ""),
+            video_filename=entry.video_filename if entry is not None else Path(info.path).name,
             frame_index=idx,
             source_width=info.width,
             source_height=info.height,
@@ -1027,6 +1068,86 @@ class App(tk.Tk):
             messagebox.showwarning("No dataset", "Open a dataset first.")
             return
         ExportDialog(self, dataset=self.dataset, metadata=self.metadata)
+
+    def open_temporal_export_dialog(self) -> None:
+        if self.dataset is None or self.metadata is None:
+            messagebox.showwarning("No dataset", "Open a dataset first.")
+            return
+        from lava_labeler.gui.temporal_export_dialog import TemporalExportDialog
+        if self.video_registry is None:
+            self.video_registry = VideoRegistry(self.dataset.root)
+        TemporalExportDialog(
+            self, dataset=self.dataset, metadata=self.metadata,
+            video_registry=self.video_registry,
+        )
+
+    def relink_source_videos(self) -> None:
+        if self.dataset is None or self.metadata is None:
+            messagebox.showwarning("No dataset", "Open a dataset first.")
+            return
+        from lava_labeler.core.video_relink import relink_workspace_videos
+
+        folder = filedialog.askdirectory(title="Select source-video root folder")
+        if not folder:
+            return
+
+        # Dry run first.
+        try:
+            plan = relink_workspace_videos(
+                dataset_root=self.dataset.root,
+                source_video_root=Path(folder),
+                dry_run=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Relink failed", str(exc))
+            return
+
+        summary = (
+            f"Rows checked:        {plan['rows_checked']}\n"
+            f"Rows already linked: {plan['rows_already_linked']}\n"
+            f"Rows relinkable:     {plan['rows_relinkable']}\n"
+            f"Missing:             {plan['missing']}\n"
+            f"Ambiguous:           {plan['ambiguous']}\n"
+            f"Failed video reads:  {plan['failed_to_read_video']}\n\n"
+            f"Report: {plan['report_csv']}"
+        )
+        if plan["rows_relinkable"] == 0:
+            messagebox.showinfo("Relink source videos", "Nothing to relink.\n\n" + summary)
+            return
+        if not messagebox.askyesno(
+            "Relink source videos",
+            summary + "\n\nApply these changes? A backup of frames.csv will be written.",
+        ):
+            return
+
+        try:
+            result = relink_workspace_videos(
+                dataset_root=self.dataset.root,
+                source_video_root=Path(folder),
+                dry_run=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Relink failed", str(exc))
+            return
+
+        # Reload metadata and refresh UI.
+        self.metadata = MetadataStore(self.dataset.root)
+        if hasattr(self, "frame_queue"):
+            self.frame_queue.refresh()
+        if self.dataset_summary is not None:
+            self.dataset_summary.refresh()
+        if hasattr(self, "dataset_context_panel"):
+            self.dataset_context_panel.refresh()
+        self.set_status(
+            f"Relinked {result['rows_relinkable']} rows "
+            f"({result['linked_existing_path']} by path, "
+            f"{result['linked_by_filename']} by filename)"
+        )
+        messagebox.showinfo(
+            "Relink complete",
+            f"Relinked {result['rows_relinkable']} rows.\n\n"
+            f"Backup + report written under metadata/.",
+        )
 
     # ------------------------------------------------------------------
     # Status
